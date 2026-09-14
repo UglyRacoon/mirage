@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirage — AntiDetect Browser</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>◆</text></svg>">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<!-- ===== login ===== -->
+<div id="login" class="login hidden">
+  <div class="login-card">
+    <div class="login-logo">◆</div>
+    <h1>Mirage</h1>
+    <p class="login-sub">AntiDetect Browser · Control Plane</p>
+    <div class="pinpad" id="pinpad">
+      <div class="pin-dots" id="pinDots"></div>
+      <div class="pin-keys" id="pinKeys"></div>
+      <div class="pin-hint">default PIN: <b>mirage</b> · change in Settings → Team</div>
+      <div class="pin-err" id="pinErr"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ===== shell ===== -->
+<div class="shell">
+  <aside class="side">
+    <div class="brand"><span class="brand-ico">◆</span><span class="brand-name">Mirage</span><span class="brand-tag">ANTIDETECT</span></div>
+    <nav id="nav">
+      <a href="#/dashboard" data-v="dashboard"><i>▦</i><span data-i18n="nav.dashboard">Dashboard</span></a>
+      <a href="#/profiles" data-v="profiles"><i>◪</i><span data-i18n="nav.profiles">Profiles</span><em id="navProfilesN" class="count"></em></a>
+      <a href="#/proxies" data-v="proxies"><i>⇄</i><span data-i18n="nav.proxies">Proxies</span><em id="navProxiesN" class="count"></em></a>
+      <a href="#/checker" data-v="checker"><i>⌕</i><span data-i18n="nav.checker">Fingerprint Lab</span></a>
+      <a href="#/flows" data-v="flows"><i>⟿</i><span data-i18n="nav.flows">Flows (RPA)</span></a>
+      <a href="#/team" data-v="team"><i>♟</i><span data-i18n="nav.team">Team</span></a>
+      <a href="#/activity" data-v="activity"><i>≋</i><span data-i18n="nav.activity">Activity</span></a>
+      <a href="#/automation" data-v="automation"><i>⚙</i><span data-i18n="nav.api">Automation API</span></a>
+      <a href="#/settings" data-v="settings"><i>⚒</i><span data-i18n="nav.settings">Settings</span></a>
+    </nav>
+    <div class="side-foot">
+      <div class="conn"><i id="connDot" class="dot"></i><span id="connTxt">connecting…</span></div>
+      <div class="kern"><span id="kernTxt">kernel: —</span></div>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="top">
+      <div class="crumbs" id="crumbs">Dashboard</div>
+      <div class="top-actions">
+        <span class="badge hidden" id="sessionsBadge">● 0</span>
+        <button class="btn ghost sm" id="langBtn">EN</button>
+        <button class="btn primary" id="quickNew">+ <span data-i18n="act.newProfile">New Profile</span></button>
+        <div class="user" id="userChip" title="signed in">◆</div>
+      </div>
+    </header>
+    <section id="view" class="view"></section>
+  </main>
+</div>
+
+<div id="modalRoot"></div>
+<div id="toasts"></div>
+
+<script src="/js/core.js"></script>
+<script src="/js/views.js"></script>
+<script src="/js/editor.js"></script>
+<script src="/js/live.js"></script>
+</body>
+</html>

@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mirage — Anti-Detect Leak Checker</title>
+<style>
+  :root { --bg:#0b0f17; --panel:#111827; --line:#1f2937; --txt:#e5e7eb; --mut:#94a3b8; --good:#34d399; --bad:#f87171; --warn:#fbbf24; --accent:#22d3ee; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--bg); color:var(--txt); }
+  header { padding:22px 28px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap; }
+  h1 { font-size:18px; margin:0; letter-spacing:.5px; } h1 .dot { color:var(--accent); }
+  .score { font-size:40px; font-weight:800; line-height:1; }
+  .sub { color:var(--mut); font-size:12px; }
+  .banner { padding:10px 28px; font-size:13px; } .banner.in { background:rgba(34,211,238,.08); color:var(--accent); border-bottom:1px solid var(--line);} .banner.out { background:rgba(251,191,36,.08); color:var(--warn); border-bottom:1px solid var(--line);}
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(360px,1fr)); gap:14px; padding:22px 28px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+  .card h2 { font-size:13px; margin:0 0 8px; text-transform:uppercase; letter-spacing:1px; color:var(--mut); display:flex; justify-content:space-between; align-items:center; }
+  .pill { font-size:10px; padding:2px 8px; border-radius:999px; border:1px solid; }
+  .pill.good { color:var(--good); border-color:rgba(52,211,153,.4); background:rgba(52,211,153,.08); }
+  .pill.bad { color:var(--bad); border-color:rgba(248,113,113,.4); background:rgba(248,113,113,.08); }
+  .pill.warn { color:var(--warn); border-color:rgba(251,191,36,.4); background:rgba(251,191,36,.08); }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:5px 0; border-top:1px solid rgba(31,41,55,.5); font-size:12.5px; }
+  .row:first-of-type { border-top:none; }
+  .k { color:var(--mut); } .v { text-align:right; word-break:break-word; max-width:62%; }
+  .v.ok { color:var(--good);} .v.no { color:var(--bad);} .v.ww { color:var(--warn);}
+  canvas { display:none; }
+  footer { padding:18px 28px 40px; color:var(--mut); font-size:12px; }
+  a { color:var(--accent); } .raw { white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<header>
+  <div><h1><span class="dot">◆</span> Mirage Anti-Detect Leak Checker</h1><div class="sub" id="when">probing…</div></div>
+  <div style="text-align:right"><div class="score" id="score">—</div><div class="sub">reputation score</div></div>
+</header>
+<div class="banner" id="banner"></div>
+<div class="grid" id="grid"></div>
+<footer>
+  This page runs the same detections as BrowserLeaks / Pixelscan / CreepJS. Open inside a launched Mirage profile to validate the stealth bundle.
+  Kernel-level fingerprints (TLS/JA3, HTTP/2) are produced by the real Chromium build and cannot be spoofed by JavaScript alone.
+  <div id="err" style="color:var(--bad)"></div>
+</footer>
+<canvas id="c"></canvas>
+<script>
+window.mirageEsc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+(async function () {
+  const M = window.__MIRAGE;
+  const exp = (M && M.expected) || null;
+  const banner = document.getElementById('banner');
+  banner.className = 'banner ' + (M ? 'in' : 'out');
+  banner.textContent = M ? '◆ Mirage stealth kernel detected (build ' + (M.version||'?') + ') — comparing live probes against expected profile values.' : 'No Mirage bundle detected — this is a raw browser context. Launch the profile from Mirage to test its identity.';
+
+  function fnv(s){s=String(s);let h=2166136261>>>0;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return (h>>>0).toString(16);}
+  const checks = [];
+  function add(group, key, observed, status, expected){ checks.push({group, key, observed, status, expected}); }
+
+  // ---- identity / navigator ----
+  {
+    const N = navigator;
+    const ok = (a,b)=> a===b ? 'ok' : 'no';
+    add('Identity','userAgent', N.userAgent, exp?ok(N.userAgent,exp.userAgent):'ww', exp?exp.ua:null);
+    add('Identity','platform', N.platform, exp?ok(N.platform,exp.platform):'ww', exp?exp.platform:null);
+    add('Identity','vendor', N.vendor, exp?ok(N.vendor,exp.vendor):'ww', exp?exp.vendor:null);
+    add('Identity','languages', (N.languages||[]).join(','), exp?ok((N.languages||[]).join(','), (exp.languages||[]).join(',')):'ww');
+    add('Identity','hardwareConcurrency', String(N.hardwareConcurrency), exp?ok(N.hardwareConcurrency,exp.hardwareConcurrency):'ww');
+    add('Identity','deviceMemory', String(N.deviceMemory), exp?(exp.deviceMemory==null? (N.deviceMemory===undefined?'ok':'no') : ok(N.deviceMemory,exp.deviceMemory)):'ww');
+    add('Identity','maxTouchPoints', String(N.maxTouchPoints), exp?ok(N.maxTouchPoints,exp.maxTouchPoints):'ww');
+    add('Identity','doNotTrack', String(N.doNotTrack), 'ww');
+    add('Identity','webdriver', String(N.webdriver), String(N.webdriver)==='false'?'ok':'no');
+    // client hints
+    try {
+      if (N.userAgentData) {
+        const hei = await N.userAgentData.getHighEntropyValues(['platform','platformVersion','architecture','bitness','fullVersionList','uaFullVersion','model']);
+        const eh = exp && exp.clientHints && exp.clientHints.supported;
+        add('Client Hints','Sec-CH-UA-Platform', String(hei.platform), eh?ok(hei.platform, exp.clientHints.platform): (N.userAgentData?'no':'ok'));
+        add('Client Hints','mobile', String(hei.mobile), eh?ok(hei.mobile, exp.clientHints.mobile):'ww');
+        add('Client Hints','fullVersionList', (hei.fullVersionList||[]).map(b=>b.brand+' '+b.version).join(' | '), eh?'ok':'ww');
+      } else {
+        const expectNone = exp && exp.clientHints && !exp.clientHints.supported;
+        add('Client Hints','navigator.userAgentData', 'undefined', expectNone?'ok':'ww');
+      }
+    } catch(e){ add('Client Hints','error', String(e.message), 'ww'); }
+  }
+
+  // ---- timezone / locale ----
+  {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    add('Time & Locale','Intl timeZone', tz, exp&&exp.timezone?ok(tz,exp.timezone):'ww');
+    add('Time & Locale','Date offset (min)', String(new Date().getTimezoneOffset()), exp&&typeof exp.tzOffset==='number'? (new Date().getTimezoneOffset()===-exp.tzOffset?'ok':'no'):'ww');
+    add('Time & Locale','locale', Intl.DateTimeFormat().resolvedOptions().locale, 'ww');
+    const d = new Date(); const s = d.toString();
+    add('Time & Locale','Date.toString', s.slice(0, s.indexOf(')')+1)||s, 'ww');
+  }
+
+  // ---- screen ----
+  {
+    const S = window.screen;
+    add('Screen','resolution', S.width+'x'+S.height, exp&&exp.screen?ok(S.width,exp.screen.width)&&ok(S.height,exp.screen.height):'ww');
+    add('Screen','available', S.availWidth+'x'+S.availHeight, exp&&exp.screen?ok(S.availHeight, exp.screen.availHeight):'ww');
+    add('Screen','devicePixelRatio', String(devicePixelRatio), exp&&exp.dpr?ok(devicePixelRatio, exp.dpr):'ww');
+    add('Screen','colorDepth', String(S.colorDepth), 'ww');
+    add('Screen','inner×outer', innerWidth+'×'+innerHeight+' / '+outerWidth+'×'+outerHeight, 'ww');
+  }
+
+  // ---- canvas ----
+  {
+    const c = document.getElementById('c'); c.width=240; c.height=60; const x=c.getContext('2d');
+    x.textBaseline='top'; x.font='16px "Arial"'; x.fillStyle='#f60'; x.fillRect(0,0,120,30);
+    x.fillStyle='#000'; x.fillText('Mirage © ⚑ 0123456789', 2, 2);
+    const d1 = c.toDataURL();
+    // getImageData hash
+    let g='n/a'; try { const im=x.getImageData(0,0,240,60).data; let acc=0; for(let i=0;i<im.length;i+=997) acc=(acc*31+im[i])>>>0; g=acc.toString(16); } catch(e){}
+    const stable = (() => { const y=document.getElementById('c'); try { const a=y.toDataURL(); const b=y.toDataURL(); return a===b?'stable':'varies'; } catch(e){return 'n/a';} })();
+    add('Canvas','toDataURL hash', fnv(d1), exp&&exp.canvasMode&&exp.canvasMode!=='off'?(stable==='stable'?'ok':'ww'):'ww');
+    add('Canvas','getImageData hash', g, 'ww');
+    add('Canvas','export stability', stable, exp&&exp.canvasMode&&exp.canvasMode!=='off'?(stable==='stable'?'ok':'no'):'ww');
+  }
+
+  // ---- webgl ----
+  {
+    try {
+      const cc = document.createElement('canvas'); const gl = cc.getContext('webgl') || cc.getContext('experimental-webgl');
+      const cc2 = document.createElement('canvas'); const gl2 = cc2.getContext('webgl2');  // separate canvas: one context type per canvas
+      const dbg = gl && gl.getExtension('WEBGL_debug_renderer_info');
+      add('WebGL','VENDOR', gl?gl.getParameter(gl.VENDOR):'n/a', 'ww');
+      add('WebGL','RENDERER', gl?gl.getParameter(gl.RENDERER):'n/a', 'ww');
+      const uV = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : 'n/a';
+      const uR = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'n/a';
+      add('WebGL','UNMASKED_VENDOR', uV, exp&&exp.webgl&&dbg ? ok(uV, exp.webgl.unmaskedVendor) : 'ww');
+      add('WebGL','UNMASKED_RENDERER', uR, exp&&exp.webgl&&dbg ? ok(uR, exp.webgl.unmaskedRenderer) : 'ww');
+      add('WebGL','VERSION', gl?gl.getParameter(gl.VERSION):'n/a', 'ww');
+      const exts = gl&&gl.getSupportedExtensions ? gl.getSupportedExtensions() : [];
+      add('WebGL','extensions #', String(exts.length), exp&&exp.webgl ? ok(exts.length, exp.webgl.extensions.length) : 'ww');
+    add('WebGL','WebGL2', gl2? 'available':'absent', exp&&exp.webgl ? ok(!!gl2, !!exp.webgl.webgl2) : 'ww');
+      if (gl && exp && exp.webgl && exp.webgl.limits) {
+        const L = exp.webgl.limits;
+        add('WebGL','MAX_TEXTURE_SIZE', String(gl.getParameter(gl.MAX_TEXTURE_SIZE)), ok(gl.getParameter(gl.MAX_TEXTURE_SIZE), L.maxTextureSize));
+        add('WebGL','MAX_VIEWPORT_DIMS', String(gl.getParameter(gl.MAX_VIEWPORT_DIMS)[0]), ok(gl.getParameter(gl.MAX_VIEWPORT_DIMS)[0], L.maxViewportDims[0]));
+        const P = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT);
+        add('WebGL','HIGH_FLOAT precision', P?String(P.precision):'n/a', exp.webgl.precision&&P?ok(P.precision, exp.webgl.precision.high.precision):'ww');
+      }
+    } catch(e){ add('WebGL','error', String(e.message), 'no'); }
+    // webgpu — must be internally consistent: present & matching vendor, OR absent by design
+    try {
+      if (navigator.gpu) {
+        const ad = await navigator.gpu.requestAdapter();
+        const info = ad && (ad.info || (ad.requestAdapterInfo ? await ad.requestAdapterInfo() : null));
+        let st;
+        if (!ad) st = 'ww';
+        else if (exp && exp.webgpu && info) st = ok(info.vendor, exp.webgpu.vendor);
+        else if (exp && !exp.webgpu) st = 'no';        // expected hidden but GPU surface present = leak
+        else st = 'ww';
+        add('WebGPU','adapter', info ? (info.vendor + '/' + (info.device || '')) : (ad ? 'adapter (no info)' : 'null'), st);
+      } else {
+        add('WebGPU','navigator.gpu', 'absent', exp && exp.webgpu ? 'no' : 'ok');
+      }
+    } catch(e){ add('WebGPU','error', String(e.message), 'ww'); }
+  }
+
+  // ---- audio ----
+  {
+    try {
+      const AC = window.AudioContext || window.OfflineAudioContext;
+      const ctx = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 4096, 44100);
+      const o = ctx.createOscillator(); const an = ctx.createAnalyser(); o.connect(an); an.connect(ctx.destination); o.start();
+      const buf = await ctx.startRendering(); const d = buf.getChannelData(0);
+      let a=0; for (let i=0;i<d.length;i++) a=(a*17 + Math.abs(d[i]*1e10))>>>0;
+      const b=await(async()=>{const ctx2=new (window.OfflineAudioContext)(1,4096,44100);const o2=ctx2.createOscillator();o2.connect(ctx2.destination);o2.start();const r=await ctx2.startRendering();const x=r.getChannelData(0);let y=0;for(let i=0;i<x.length;i++)y=(y*17+Math.abs(x[i]*1e10))>>>0;return y.toString(16);})();
+      add('Audio','OfflineAudioContext hash', a.toString(16), exp&&exp.audioMode&&exp.audioMode!=='off'?'ok':'ww');
+      add('Audio','render determinism', a>>>0 === parseInt(b,16)?'stable':'varies', exp&&exp.audioMode&&exp.audioMode!=='off'?(a>>>0===parseInt(b,16)?'ok':'no'):'ww');
+      try { const ac = new (window.AudioContext||window.webkitAudioContext)(); add('Audio','hardware sampleRate', String(ac.sampleRate), exp&&exp.audioRate?ok(ac.sampleRate,exp.audioRate):'ww'); if(ac.sampleRate) try{ac.close();}catch(e){} } catch(e){}
+    } catch(e){ add('Audio','error', String(e.message),'ww'); }
+  }
+
+  // ---- media devices ----
+  {
+    try {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const list = devs.map(d=>d.kind).join(',');
+      add('Media','device count', String(devs.length), exp&&exp.mediaDevices?ok(devs.length, exp.mediaDevices.length):'ww');
+      add('Media','labels visible', devs.some(d=>d.label)?'yes':'no', 'ww');
+      add('Media','kinds', list||'n/a', 'ww');
+    } catch(e){ add('Media','error', String(e.message),'ww'); }
+  }
+
+  // ---- fonts ----
+  {
+    try {
+      const testFonts = ['Arial','Segoe UI','Helvetica Neue','DejaVu Sans','Menlo','Consolas','NotInAnyFont'];
+      const res = testFonts.map(f=>({f, inList: exp&&exp.fonts?exp.fonts.includes(f):document.fonts.check('12px "'+f+'"'), check: document.fonts.check('12px "'+f+'"')}));
+      const spoofed = exp && exp.fonts && exp.fonts.length;
+      const bad = res.some(r=> r.f!=='NotInAnyFont' && spoofed && r.inList !== r.check);
+      add('Fonts','document.fonts.check sample', res.map(r=>r.f+':'+(r.check?'Y':'N')).join(' '), spoofed?(bad?'no':'ok'):'ww');
+      // offsetWidth trick (patched measureText should be deterministic per profile)
+      add('Fonts','enumeration mode', spoofed?'profile ('+exp.fonts.length+' fonts)':'real system', spoofed?'ok':'ww');
+    } catch(e){ add('Fonts','error', String(e.message),'ww'); }
+  }
+
+  // ---- speech voices ----
+  {
+    try {
+      const voices = (speechSynthesis&&speechSynthesis.getVoices? speechSynthesis.getVoices():[]);
+      add('Speech','voice count', String(voices.length), exp&&exp.voices?ok(voices.length, exp.voices.length):'ww');
+      add('Speech','sample', voices.slice(0,2).map(v=>v.name).join(', ')||'n/a', 'ww');
+    } catch(e){ add('Speech','error', String(e.message),'ww'); }
+  }
+
+  // ---- battery ----
+  {
+    try { if (navigator.getBattery) { const b = await navigator.getBattery(); const lvlOk = !exp||!exp.battery?false:Math.abs(b.level-exp.battery.level)<=0.02; add('Battery','charging/level', String(b.charging)+' / '+b.level, exp&&exp.battery?(b.charging===exp.battery.charging&&lvlOk?'ok':'no'):'ww'); } else add('Battery','getBattery','unsupported (expected on Safari/Firefox)','ww'); } catch(e){ add('Battery','error',String(e.message),'ww'); }
+  }
+
+  // ---- "already-alive" liveness ----
+  {
+    add('Liveness','history.length', String(history.length), (exp&&exp.alive&&exp.alive.historyLength) ? (history.length>=exp.alive.historyLength?'ok':'no') : (history.length>1?'ok':'ww'));
+    add('Liveness','visibilityState', document.visibilityState, document.visibilityState==='visible'?'ok':'no');
+    try { if (performance.memory) add('Liveness','perf.memory used>0', String(!!(performance.memory.usedJSHeapSize>0 && performance.memory.jsHeapSizeLimit>performance.memory.usedJSHeapSize)), (performance.memory.usedJSHeapSize>0&&performance.memory.jsHeapSizeLimit>performance.memory.usedJSHeapSize)?'ok':'no'); else add('Liveness','performance.memory', navigator.vendor&&/Google/.test(navigator.vendor)?'missing (chrome should have it)':'n/a (non-chromium)', 'ww'); } catch(e){}
+    try { if (navigator.storage&&navigator.storage.estimate){ const est=await navigator.storage.estimate(); add('Liveness','storage quota>0', String(est.quota>0&&est.usage>=0), est.quota>0?'ok':'no'); } } catch(e){}
+  }
+
+  // ---- geolocation ----
+  {
+    add('Geo','policy', (navigator.permissions? 'api':'n/a'), exp&&exp.geo&&exp.geo.mode==='custom'?'ok':'ww');
+    try {
+      if (exp && exp.geo && exp.geo.mode==='custom' && navigator.geolocation) {
+        const pos = await new Promise((res,rej)=>{ let done=false; const t=setTimeout(()=>{if(!done){done=true;rej(new Error('timeout'))}},2500); navigator.geolocation.getCurrentPosition(p=>{if(!done){done=true;clearTimeout(t);res(p)}},e=>{if(!done){done=true;clearTimeout(t);rej(e)}}, {enableHighAccuracy:false, timeout:2000}); });
+        add('Geo','returned', pos.coords.latitude.toFixed(2)+','+pos.coords.longitude.toFixed(2), ok(pos.coords.latitude.toFixed(2), exp.geo.lat.toFixed(2))==='ok'?'ok':'ww');
+      }
+    } catch(e){ add('Geo','error', String(e.message),'ww'); }
+  }
+
+  // ---- WebRTC ICE leak + transport consistency ----
+  {
+    try {
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] }); pc.createDataChannel('');
+      const sdp = await pc.createOffer(); await pc.setLocalDescription(sdp);
+      const cands = [];
+      pc.onicecandidate = (e)=>{ if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate); };
+      await new Promise(r=>setTimeout(r, 1600));
+      pc.close();
+      const isPrivate = ip => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|169\.254\.|::|fd)/i.test(ip);
+      const ipOf = c => (c.match(/([0-9]{1,3}(\.[0-9]{1,3}){3})/g)||[])[0];
+      const typeOf = c => (c.match(/typ (host|srflx|relay|prflx)/)||[])[1];
+      const ips = cands.map(ipOf).filter(Boolean);
+      const types = cands.map(typeOf).filter(Boolean);
+      let status='ww';
+      const allowed = new Set(exp&&exp.webrtc?[exp.webrtc.fakeLocalIp, exp.webrtc.fakePublicIp, exp.webrtc.egressPublicIp].filter(Boolean):[]);
+      if (exp && exp.webrtc) {
+        if (exp.webrtc.mode==='disable') status = ips.length? 'no':'ok';
+        else if (exp.webrtc.mode==='real') status = 'ww';
+        else { const bad = ips.filter(ip => !isPrivate(ip) && !allowed.has(ip)); status = bad.length ? 'no' : 'ok'; }
+      }
+      add('WebRTC','ICE candidates (IPs)', ips.join(', ')||'none observed', status, exp&&exp.webrtc?exp.webrtc.mode:null);
+      add('WebRTC','candidate types', types.join(',')||'none', 'ww');
+      if (exp && exp.webrtc && exp.webrtc.mode!=='real') {
+        const pubs = cands.filter(c=>['srflx','relay'].includes(typeOf(c))).map(ipOf).filter(ip=>ip&&!isPrivate(ip));
+        const want = exp.webrtc.egressPublicIp || exp.webrtc.fakePublicIp;
+        const consistent = pubs.length===0 || pubs.every(ip=>ip===want);
+        add('WebRTC','public == egress', (pubs[0]||'—')+' vs '+(want||'—'), consistent?'ok':'no');
+      }
+    } catch(e){ add('WebRTC','error', String(e.message),'ww'); }
+  }
+
+  // ---- automation traces ----
+  {
+    add('Stealth','navigator.webdriver', String(navigator.webdriver), String(navigator.webdriver)==='false'?'ok':'no');
+    add('Stealth','window.chrome', typeof window.chrome, (exp && exp.userAgent && /Chrome/.test(exp.ua) && !/Firefox|Safari\/604|Version\//.test(exp.ua)) ? (window.chrome?'ok':'no') : 'ww');
+    const tls = {}; try { tls.Self = /native code/.test(Function.prototype.toString.toString()); tls.FontsCheck = /native code/.test(document.fonts.check.toString()); tls.GP = !!(window.WebGLRenderingContext && /native code/.test(WebGLRenderingContext.prototype.getParameter.toString())); } catch(e){}
+    add('Stealth','toString self-hides', String(tls.Self), tls.Self?'ok':'no');
+    add('Stealth','patched surfaces report native', 'fonts.check:'+!!tls.FontsCheck+' gl:'+!!tls.GP, (tls.FontsCheck && tls.GP)?'ok':'no');
+    let canvasPatched=false; try { canvasPatched = Function.prototype.toString.call(HTMLCanvasElement.prototype.toDataURL).includes('[native code]'); } catch(e){}
+    add('Stealth','Canvas.toDataURL native', canvasPatched?'yes (hidden)':'exposed', canvasPatched?'ok':'no');
+    // CDP / DevTools binding artifacts must be gone (they betray remote control)
+    let cdc=null; try { cdc = Object.getOwnPropertyNames(window).some(k=>/^\$?(_?)cdc_|asyncCall|selenium|webdriver/i.test(k)); } catch(e){}
+    add('Stealth','CDP binding artifacts', cdc?'PRESENT — leak':'absent', cdc?'no':'ok');
+    // headless Chrome reports 0 plugins — a real browser exposes a PDF/plugin set
+    const isDesktopChrome = exp && exp.browser && ['chrome','edge'].includes(exp.browser) && !['android','ios'].includes(exp.fam||'');
+    const pl = (navigator.plugins && navigator.plugins.length) || 0;
+    add('Stealth','plugins present', String(pl), isDesktopChrome ? (pl>0?'ok':'no') : (pl>0?'ok':'ww'));
+  }
+
+  // ---- build report ----
+  const groups = {};
+  checks.forEach(c=>{ (groups[c.group]=groups[c.group]||[]).push(c); });
+  const grid = document.getElementById('grid');
+  Object.entries(groups).forEach(([g, items])=>{
+    const good = items.filter(i=>i.status==='ok').length, bad = items.filter(i=>i.status==='no').length, warn = items.filter(i=>i.status==='ww').length;
+    const el = document.createElement('div'); el.className='card';
+    const pill = bad? '<span class="pill bad">'+bad+' leak</span>' : (good?'<span class="pill good">clean</span>':'<span class="pill warn">n/a</span>');
+    el.innerHTML = '<h2>'+g+' '+pill+'</h2>' + items.map(i=>{
+      const vcls = i.status==='ok'?'v ok':i.status==='no'?'v no':i.status==='ww'?'v ww':'v';
+      const val = String(i.observed); const short = val.length>70? val.slice(0,67)+'…' : val;
+      return '<div class="row"><span class="k">'+window.mirageEsc(i.key)+'</span><span class="'+vcls+'" title="'+ window.mirageEsc(val) +'">'+ window.mirageEsc(short) +'</span></div>';
+    }).join('');
+    grid.appendChild(el);
+  });
+  const total = checks.length, okn = checks.filter(c=>c.status==='ok').length, non=checks.filter(c=>c.status==='no').length;
+  const verifiable = okn + non; let score = exp? (verifiable? Math.round(okn/verifiable*100) : 100) : (non? 30:60);
+  if (exp && exp.canvasMode==='off') score-=15;
+  document.getElementById('score').textContent = exp? score+'%' : '?';
+  document.getElementById('score').style.color = non? 'var(--bad)': (exp? 'var(--good)':'var(--warn)');
+  document.getElementById('when').textContent = new Date().toISOString()+' · '+total+' probes · '+okn+' verified · '+non+' leaked';
+
+  try { ruify(); } catch (e) { }
+  window.__MIRAGE_REPORT = { score, leaks: non, total, checks, expected: !!exp, ua: navigator.userAgent };
+  if (window.parent !== window) { /* opened by control plane for auto-run */ }
+  console.log('Mirage checker report', window.__MIRAGE_REPORT);
+})();
+function ok(a,b){ return a===b?'ok':'no'; }
+function ruify() {
+  const ru = localStorage.getItem('mg_lang') === 'ru' || new URLSearchParams(location.search).get('lang') === 'ru';
+  if (!ru) return;
+  const G = { Identity: 'Личность', 'Client Hints': 'Client Hints', Time: 'Время', 'Time & Locale': 'Время и локаль', 'Time · Locale': 'Время и локаль', Screen: 'Экран', Fonts: 'Шрифты', Speech: 'Речь', Battery: 'Батарея', Geo: 'Гео', Geolocation: 'Геолокация', Media: 'Медиа', Stealth: 'Сте́лс', Codecs: 'Кодеки', Storage: 'Хранилище', Touch: 'Тач', 'Client Hints · UA-CH': 'Client Hints · UA-CH', Hardware: 'Железо', Network: 'Сеть', Plugins: 'Плагины', MIME: 'MIME', Liveness: 'Живость' };
+  document.querySelectorAll('#grid .card h2').forEach(h => {
+    const n = h.childNodes[0]; if (!n || n.nodeType !== 3) return;
+    const g = n.textContent.trim().replace(/:$/, ''); if (G[g]) n.textContent = ' ' + G[g] + ' ';
+    h.innerHTML = h.innerHTML.replace(/>clean</, '>чисто<').replace(/>n\/a</, '>н/д<').replace(/>(\d+) leak</, '>$1 утечка<');
+  });
+  const w = document.getElementById('when');
+  if (w) w.textContent = w.textContent.replace('probes', 'проб').replace('verified', 'подтверждено').replace('leaked', 'утечк(и)');
+  const h1 = document.querySelector('h1'); if (h1) h1.innerHTML = h1.innerHTML.replace('Mirage Anti-Detect Leak Checker', 'Mirage — проверка утечек анти-детект');
+  document.querySelectorAll('.sub').forEach(s => { if (s.textContent.trim() === 'reputation score') s.textContent = 'оценка подлинности'; });
+  document.title = 'Mirage — проверка утечек анти-детект';
+}
+</script>
+</body>
+</html>

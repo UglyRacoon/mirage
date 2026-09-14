@@ -1,0 +1,12 @@
+# runtime data (SQLite db, per-profile kernel dirs, secrets, cookies)
+data/
+
+# deps / OS cruft
+node_modules/
+.DS_Store
+*.log
+npm-debug.log*
+
+# local overrides
+.env
+*.local

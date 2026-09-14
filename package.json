@@ -1,0 +1,15 @@
+{
+  "name": "mirage",
+  "version": "1.0.0",
+  "description": "Mirage — a fully web-based anti-detect browser control plane. Profile-based fingerprint spoofing (Canvas, WebGL, Audio, Fonts, WebRTC, Client Hints, Timezone, Geolocation, HW), proxy manager, live CDP browser control, and an AdsPower-style automation API. Zero runtime dependencies (Node stdlib + node:sqlite).",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": { "node": ">=22.5.0" },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "selftest": "node test/selftest.js"
+  },
+  "bin": { "mirage": "src/index.js" },
+  "license": "MIT"
+}
