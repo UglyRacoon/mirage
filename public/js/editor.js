@@ -60,7 +60,7 @@ ROUTES.profileEditor = async (view, params) => {
   };
   document.getElementById('edApplyTmpl').onclick = () => identityModal(id);
   document.getElementById('edChecker').onclick = () => guard(async () => {
-    const out = document.getElementById('checkerOut'); out.innerHTML = '<span class="spin"></span> launching kernel + running 47 probes inside real browser…';
+    const out = document.getElementById('checkerOut'); out.innerHTML = '<span class="spin"></span> launching kernel + running 60 probes inside real browser…';
     const r = await api(`/api/checker/run/${id}`, { method: 'POST', body: {} });
     out.innerHTML = `<div class="issue ${r.leaks ? 'critical' : 'info'}"><b>in-browser result</b>${r.leaks ? `<span class="bad-c">${r.leaks} leak(s)</span>` : '<span class="ok-c">no leaks detected</span>'} · ${r.checks.filter(c => c.status === 'ok').length}/${r.total} probes verified</div>
       ${r.checks.filter(c => c.status === 'no').map(c => `<div class="issue critical">${App.esc(c.group)} → ${App.esc(c.key)}: ${App.esc(String(c.observed).slice(0, 60))}</div>`).join('')}

@@ -112,10 +112,10 @@ const RU = {
   'Launched': 'Запущено', 'Snapshot saved': 'Снапшот сохранён',
   // fingerprint lab
   'Audit target': 'Объект проверки', 'Identity source': 'Источник идентичности',
-  '⌕ Launch kernel & run 48-probe audit': '⌕ Запустить ядро и прогнать 48 проб',
+  '⌕ Launch kernel & run 60-probe audit': '⌕ Запустить ядро и прогнать 60 проб',
   'Public checkers': 'Публичные детекторы', 'Last result': 'Последний результат', 'not run yet': 'ещё не запускалось',
   'What is tested': 'Что проверяется', '▶ kernel': '▶ в ядро', 'booting…': 'старт…', 'opening…': 'открываю…',
-  'watch this kernel →': 'смотреть это ядро →', 'launching kernel + running 48 probes…': 'запускаю ядро + 48 проб…',
+  'watch this kernel →': 'смотреть это ядро →', 'launching kernel + running 60 probes…': 'запускаю ядро + 60 проб…',
   'run failed': 'сбой прогона', 'result': 'итог', 'leak(s)': 'утечки', 'probes verified': 'проб подтверждено',
   'CLEAN': 'ЧИСТО',
   // editor tabs / section headers / misc buttons

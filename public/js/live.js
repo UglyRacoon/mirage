@@ -180,15 +180,15 @@ const EXT_CHECKERS = [
 ];
 ROUTES.checker = (view) => {
   view.innerHTML = `
-  <div class="toolbar"><div style="font-size:13px;color:var(--mut)">Pick what to audit — Mirage's 48-probe lab and the well-known public checkers all run against the selected resource.</div><div class="grow"></div></div>
+  <div class="toolbar"><div style="font-size:13px;color:var(--mut)">Pick what to audit — Mirage's 60-probe lab and the well-known public checkers all run against the selected resource.</div><div class="grow"></div></div>
   <div class="chk-wrap">
     <div><iframe id="chkFrame" class="chk-frame" src="/checker"></iframe></div>
     <div style="display:grid;gap:14px;align-content:start">
       <div class="card"><h3>Audit target</h3>
         <div class="form">
           <div><label>Identity source</label><select id="ckPid">${App.state.profiles.map(p => `<option value="${p.id}">${App.esc(p.name)} (◆${p.score})</option>`).join('')}</select></div>
-          <button class="btn primary" id="ckRun" style="justify-content:center">⌕ Launch kernel &amp; run 48-probe audit</button>
-          <div class="hint">Left pane is your own browser — it is NOT masked (comparison only). The kernel audit runs all 48 probes inside the real patched profile browser against its expected identity map.</div>
+          <button class="btn primary" id="ckRun" style="justify-content:center">⌕ Launch kernel &amp; run 60-probe audit</button>
+          <div class="hint">Left pane is your own browser — it is NOT masked (comparison only). The kernel audit runs all 60 probes inside the real patched profile browser against its expected identity map.</div>
         </div></div>
       <div class="card"><h3>Last result</h3><div id="ckOut" class="dim">not run yet</div></div>
       <div class="card"><h3>Public checkers</h3>
@@ -213,14 +213,15 @@ ROUTES.checker = (view) => {
     const pid = val('ckPid'); const out = document.getElementById('ckOut'); const btn = document.getElementById('ckRun');
     ckBusy = true; btn.disabled = true;
     const t0 = Date.now();
-    out.innerHTML = `<div style="display:flex;gap:8px;align-items:center"><span class="spin"></span><span>launching kernel + running 48 probes…</span><b class="dim" id="ckEl">0s</b></div>`;
+    out.innerHTML = `<div style="display:flex;gap:8px;align-items:center"><span class="spin"></span><span>launching kernel + running 60 probes…</span><b class="dim" id="ckEl">0s</b></div>`;
     const tick = setInterval(() => { const e = document.getElementById('ckEl'); if (e) e.textContent = Math.round((Date.now() - t0) / 1000) + 's'; }, 500);
     const ctl = new AbortController(); const killer = setTimeout(() => ctl.abort(), 120000);
     try {
       const r = await api(`/api/checker/run/${pid}`, { method: 'POST', body: {}, signal: ctl.signal });
       const okN = r.checks.filter(c => c.status === 'ok').length;
+      const sc = (r.score != null ? r.score : (r.total ? Math.round(okN / (okN + (r.checks.filter(c => c.status === 'no').length || 1)) * 100) : 0));
       out.innerHTML = `
-        <div class="issue ${r.leaks ? 'critical' : 'info'}"><b>result</b><span class="${r.leaks ? 'bad-c' : 'ok-c'}" style="font-size:16px;font-weight:800">${r.leaks ? r.leaks + ' leak(s)' : 'CLEAN'}</span> <span class="dim">· ${okN}/${r.total} probes verified</span></div>
+        <div class="issue ${r.leaks ? 'critical' : 'info'}"><b>result</b><span class="${r.leaks ? 'bad-c' : 'ok-c'}" style="font-size:16px;font-weight:800">${r.leaks ? r.leaks + ' leak(s)' : 'CLEAN'}</span> <span class="dim">· score</span> <b style="font-size:16px;font-weight:800;color:${sc >= 90 ? 'var(--ok)' : sc >= 70 ? 'var(--warn)' : 'var(--bad)'}">${sc}%</b> <span class="dim">· ${okN}/${r.total} probes verified</span></div>
         ${r.checks.filter(c => c.status !== 'ww').sort((a, b) => (a.status === 'no' ? -1 : 1) - (b.status === 'no' ? -1 : 1)).map(c => `
           <div class="r" style="display:flex;gap:8px;padding:3.5px 0;border-bottom:1px dashed var(--line);font-size:12px">
             <span style="min-width:14px">${c.status === 'ok' ? '<span class="ok-c">✓</span>' : '<span class="bad-c">✗</span>'}</span>

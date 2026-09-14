@@ -296,10 +296,17 @@ window.mirageEsc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
     grid.appendChild(el);
   });
   const total = checks.length, okn = checks.filter(c=>c.status==='ok').length, non=checks.filter(c=>c.status==='no').length;
-  const verifiable = okn + non; let score = exp? (verifiable? Math.round(okn/verifiable*100) : 100) : (non? 30:60);
-  if (exp && exp.canvasMode==='off') score-=15;
-  document.getElementById('score').textContent = exp? score+'%' : '?';
-  document.getElementById('score').style.color = non? 'var(--bad)': (exp? 'var(--good)':'var(--warn)');
+  // Score is ALWAYS a number: the % of probes that produced a definite verdict and passed.
+  // Inside a Mirage kernel `exp` is present → this is a true identity-consistency score vs the profile.
+  // In a raw browser (no bundle) only the baseline-free probes give verdicts → a partial self-check score.
+  const verifiable = okn + non;
+  let score = verifiable ? Math.round(okn / verifiable * 100) : (exp ? 100 : 50);
+  if (exp && exp.canvasMode === 'off') score -= 15;
+  score = Math.max(0, Math.min(100, score));
+  const sEl = document.getElementById('score');
+  sEl.textContent = score + '%';
+  sEl.title = exp ? 'Identity vs expected profile' : 'Self-checks only (not a Mirage kernel)';
+  sEl.style.color = non ? 'var(--bad)' : (exp ? 'var(--good)' : 'var(--warn)');
   document.getElementById('when').textContent = new Date().toISOString()+' · '+total+' probes · '+okn+' verified · '+non+' leaked';
 
   try { ruify(); } catch (e) { }
