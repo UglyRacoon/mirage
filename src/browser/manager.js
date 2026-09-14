@@ -104,7 +104,10 @@ export class BrowserManager {
       sess.dbgPort = await this._freePort();
       const args = this._buildArgs(profile, fp, sess, dir);
       log('browser', `launching ${profileId} (${sess.mode}) port=${sess.dbgPort} proxy=${proxy ? proxy.scheme + '://' + proxy.host : 'direct'}`);
-      sess.child = spawn(bin, args, { env, stdio: ['ignore', 'ignore', 'pipe'] });
+      // detached: put the kernel in its own process group so _cleanup can kill the ENTIRE tree
+      // (the re-exec'd browser + zygote/gpu/renderer children) and never leave an orphan holding
+      // the profile's SingletonLock (which makes every later launch silently exit code=0).
+      sess.child = spawn(bin, args, { env, stdio: ['ignore', 'ignore', 'pipe'], detached: true });
       // benign chromium noise on a headless service box — keep the journal readable for real problems
     const NOISE = /dbus|D-Bus|object_proxy|org\.freedesktop|GCM|google_apis|Registration response|DEPRECATED_ENDPOINT|cert_issuer_source_aia|Failed parsing Certificate|network_change_notifier|udev_|bluetooth|upower|bluez|GL: (error context|ESWARN|GLES|Error|QuerySupportedExtensions)|ContextResult::kFatalFailure: Failed to create|swiftshader|Failed to connect to the bus/i;
     sess.child.stderr.on('data', d => { const s = d.toString(); if (/ERROR|FATAL|Check failed|assert/i.test(s) && !NOISE.test(s)) warn('chromium', s.trim().slice(0, 300)); });
@@ -514,7 +517,12 @@ export class BrowserManager {
     sess.screencastOn = false; sess.status = 'stopped';
     for (const off of sess.listenersOff) { try { off(); } catch (e) { } }
     if (sess.cdp) { try { sess.cdp.close(); } catch (e) { } }
-    if (sess.child) { try { sess.child.kill('SIGTERM'); const ch = sess.child; setTimeout(() => { try { if (ch.exitCode === null) ch.kill('SIGKILL'); } catch (e) { } }, 2500); } catch (e) { } }
+    if (sess.child) {
+      const pid = sess.child.pid;
+      try { process.kill(-pid, 'SIGTERM'); } catch (e) { try { sess.child.kill('SIGTERM'); } catch (_) { } }
+      const ch = sess.child;
+      setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch (e) { try { if (ch.exitCode === null) ch.kill('SIGKILL'); } catch (_) { } } }, 2500);
+    }
     if (sess.xvfb) { try { sess.xvfb.kill('SIGTERM'); } catch (e) { } }
     if (sess.relay) { try { sess.relay.close(); } catch (e) { } }
     this.sessions.delete(sess.profileId);
