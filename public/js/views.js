@@ -247,6 +247,31 @@ function newProfileWizard(view) {
         </div>
       </div>
     </div>
+    <div class="card" style="margin-top:14px">
+      <h3>⚙ Generate a batch for a country</h3>
+      <div class="dim" style="margin:-4px 0 10px">Creates N unique profiles that all share the chosen country (timezone, geolocation, languages) while OS, browser, device model, screen and seed vary. Leave OS / Browser untouched to let Mirage maximize variety.</div>
+      <div class="form">
+        <div class="row3">
+          <div><label>Country</label><select id="wBatchCountry"></select></div>
+          <div><label>How many</label><input id="wBatchCount" type="number" value="5" min="1" max="100"></div>
+          <div><label>Name prefix</label><input id="wBatchPrefix" placeholder="defaults to country"></div>
+        </div>
+        <div class="row3">
+          <div><label>Group</label><select id="wBatchGroup"><option value="">None</option>${App.state.groups.map(g => `<option value="${g.id}">${App.esc(g.name)}</option>`).join('')}</select></div>
+          <div><label>Attach proxy</label><select id="wBatchProxy"><option value="">direct</option>${App.state.proxies.map(px => `<option value="${px.id}">${App.esc(px.label || (px.host + ':' + px.port))}</option>`).join('')}</select></div>
+          <div><label>Tags (comma)</label><input id="wBatchTags" placeholder="batch, farm"></div>
+        </div>
+        <label style="margin-top:4px">OS variety <span class="dim">(none checked = auto)</span></label>
+        <div id="wBatchOs" class="grid" style="grid-template-columns:repeat(auto-fill,minmax(130px,1fr))"></div>
+        <label style="margin-top:6px">Browser variety <span class="dim">(none checked = auto)</span></label>
+        <div id="wBatchBr" class="grid" style="grid-template-columns:repeat(auto-fill,minmax(110px,1fr))"></div>
+        <label class="switch" style="margin-top:8px"><input type="checkbox" id="wBatchVariant"><i></i><span class="mut">also vary engine variant (Chrome / Chromium / Superior)</span></label>
+        <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:8px">
+          <button class="btn primary" id="wBatchGo">⚙ Generate batch</button>
+        </div>
+        <div id="wBatchOut" style="margin-top:8px"></div>
+      </div>
+    </div>
   </div>`;
   const OS_OPTS = [['windows-11', 'Windows 11'], ['windows-10', 'Windows 10'], ['windows-7', 'Windows 7 (legacy)'], ['macos-sequoia', 'macOS Sequoia'], ['macos-sonoma', 'macOS Sonoma'], ['macos-ventura', 'macOS Ventura'], ['ubuntu-2404', 'Ubuntu 24.04'], ['debian-12', 'Debian 12'], ['android-14', 'Android 14'], ['android-13', 'Android 13'], ['ios-17', 'iOS 17'], ['ios-16', 'iOS 16']];
   const BR_OPTS = [['chrome', 'Chrome'], ['edge', 'Edge'], ['firefox', 'Firefox'], ['safari', 'Safari']];
@@ -257,11 +282,15 @@ function newProfileWizard(view) {
     document.getElementById('wTmpl').onclick = e => { const b = e.target.closest('[data-t]'); if (!b) return; const t = r.templates.find(x => x.id === b.dataset.t); document.getElementById('wOs').value = t.os; document.getElementById('wBr').value = t.browser; document.querySelectorAll('#wTmpl [data-t]').forEach(x => x.classList.toggle('ok', x === b)); };
   });
   const guessCountry = ((navigator.language || '').split('-')[1] || '').toUpperCase();
-  {
-    const sel = document.getElementById('wCountry');
-    const countries = ['US', 'DE', 'GB', 'FR', 'NL', 'ES', 'IT', 'PL', 'BR', 'CA', 'AU', 'JP', 'KR', 'IN', 'UA', 'SE', 'NO', 'FI', 'PT', 'MX', 'AR', 'SG', 'AE', 'TR', 'RO', 'CZ', 'RU'];
-    sel.innerHTML = `<option value="">random</option>` + countries.map(c => `<option value="${c}" ${c === guessCountry ? 'selected' : ''}>${c}${c === guessCountry ? ' ← your locale' : ''}</option>`).join('');
-  }
+  const FALLBACK_COUNTRIES = ['US', 'DE', 'GB', 'FR', 'NL', 'ES', 'IT', 'PL', 'BR', 'CA', 'AU', 'JP', 'KR', 'IN', 'UA', 'SE', 'NO', 'FI', 'PT', 'MX', 'AR', 'SG', 'AE', 'TR', 'RO', 'CZ', 'RU'];
+  const chips = (host, opts) => { host.innerHTML = opts.map(o => `<label class="ck" style="display:flex;align-items:center;gap:6px;padding:1px 0"><input type="checkbox" class="chip" value="${o[0]}"> ${o[1]}</label>`).join(''); };
+  chips(document.getElementById('wBatchOs'), OS_OPTS);
+  chips(document.getElementById('wBatchBr'), BR_OPTS);
+  api('/api/fingerprint/countries').then(r => r.countries).catch(() => null).then(cs => {
+    const list = (cs && cs.length ? cs : FALLBACK_COUNTRIES);
+    document.getElementById('wCountry').innerHTML = '<option value="">random</option>' + list.map(c => `<option value="${c}" ${c === guessCountry ? 'selected' : ''}>${c}${c === guessCountry ? ' ← your locale' : ''}</option>`).join('');
+    document.getElementById('wBatchCountry').innerHTML = list.map(c => `<option value="${c}" ${c === guessCountry ? 'selected' : ''}>${c}</option>`).join('');
+  });
   document.getElementById('wDice').onclick = () => { document.getElementById('wSeed').value = Math.random().toString(36).slice(2, 10); };
   document.getElementById('wCreate').onclick = () => guard(async () => {
     const b = await api('/api/fingerprint/generate', { method: 'POST', body: { os: val('wOs'), browser: val('wBr'), country: val('wCountry'), seed: val('wSeed') || undefined } });
@@ -270,6 +299,21 @@ function newProfileWizard(view) {
     await refreshAll();
     toast('Profile created', 'ok');
     go('#/profiles/' + r.profile.id);
+  });
+  document.getElementById('wBatchGo').onclick = () => guard(async () => {
+    const out = document.getElementById('wBatchOut');
+    const osList = [...document.querySelectorAll('#wBatchOs .chip:checked')].map(x => x.value);
+    const browserList = [...document.querySelectorAll('#wBatchBr .chip:checked')].map(x => x.value);
+    const count = Math.max(1, Math.min(100, +val('wBatchCount') || 5));
+    out.innerHTML = `<div class="dim"><span class="spin"></span> Generating ${count} profiles…</div>`;
+    const r = await api('/api/profiles/generate-bulk', { method: 'POST', body: {
+      country: val('wBatchCountry'), count, osList, browserList,
+      namePrefix: val('wBatchPrefix') || undefined, group_id: val('wBatchGroup'),
+      proxy_id: val('wBatchProxy'), tags: (val('wBatchTags') || '').split(',').map(s => s.trim()).filter(Boolean),
+      forceVariant: document.getElementById('wBatchVariant').checked } });
+    await refreshAll();
+    out.innerHTML = `<div class="issue info">✓ Created <b>${r.created}</b> ${App.esc(r.country)} profiles with varied fingerprints. <span class="link" style="cursor:pointer" onclick="go('#/profiles')">View profiles →</span></div>`;
+    toast(`Generated ${r.created} profiles`, 'ok');
   });
 }
 
@@ -280,6 +324,7 @@ ROUTES.proxies = (view) => {
     <div class="search grow"><input id="xq" placeholder="search host, label, city…"></div>
     <button class="btn" id="xProbeAll">⇅ Probe all</button>
     <button class="btn ghost" id="xImport">⤒ Bulk import</button>
+    <button class="btn ghost" id="xSources">☁ From public sources</button>
     <button class="btn primary" id="xAdd">+ Add proxy</button>
   </div>
   <div class="card" style="padding:6px 10px"><table class="tbl"><thead><tr>
@@ -315,10 +360,15 @@ ROUTES.proxies = (view) => {
   };
   document.getElementById('xAdd').onclick = () => proxyForm(null, draw);
   document.getElementById('xImport').onclick = () => importProxies(draw);
+  document.getElementById('xSources').onclick = () => fetchFromSources(draw);
   document.getElementById('xProbeAll').onclick = () => guard(async () => {
+    if (!App.state.proxies.length) return toast('No proxies to probe', 'err');
     toast('Probing all proxies…');
-    for (const px of App.state.proxies) { try { await api(`/api/proxies/${px.id}/probe`, { method: 'POST', body: {} }); } catch (e) { } }
-    await refreshAll(); draw(); toast('Probes complete', 'ok');
+    document.getElementById('xProbeAll').disabled = true;
+    try {
+      const r = await api('/api/proxies/probe-all', { method: 'POST', body: { concurrency: 10 } });
+      await refreshAll(); draw(); toast(`Probe complete · ${r.alive} alive / ${r.dead} dead`, r.alive ? 'ok' : 'err');
+    } finally { const b = document.getElementById('xProbeAll'); if (b) b.disabled = false; }
   });
   draw();
 };
@@ -354,9 +404,70 @@ function proxyBody(root) {
   return { label: root.querySelector('#pxLabel').value, scheme: root.querySelector('#pxScheme').value, host: root.querySelector('#pxHost').value.trim(), port: +root.querySelector('#pxPort').value, user: root.querySelector('#pxUser').value, pass: root.querySelector('#pxPass').value, country: root.querySelector('#pxCountry').value, city: root.querySelector('#pxCity').value, rotator: root.querySelector('#pxRot').checked ? 1 : 0 };
 }
 function importProxies(onDone) {
-  modal({ title: 'Bulk import proxies', body: `<label>One per line — <span class="mono">host:port</span>, <span class="mono">user:pass@host:port</span> or <span class="mono">socks5://user:pass@host:port</span></label>
+  modal({ title: 'Bulk import proxies', body: `<label>One per line — <span class="mono">host:port</span>, <span class="mono">user:pass@host:port</span>, <span class="mono">host:port:user:pass</span> or <span class="mono">socks5://user:pass@host:port</span></label>
     <textarea id="impText" rows="10" placeholder="185.10.23.5:8080&#10;login:secret@gate.proxysite.com:7000&#10;socks5://user:pass@1.2.3.4:1080"></textarea>
-    <label class="switch" style="margin-top:10px"><input type="checkbox" id="impRot"><i></i><span class="mut">mark as rotators</span></label>`, actions: [{ label: 'Import', kind: 'primary', onClick: async ({ bodyEl }) => { const r = await api('/api/proxies/import', { method: 'POST', body: { text: bodyEl.querySelector('#impText').value, rotator: bodyEl.querySelector('#impRot').checked } }); await refreshAll(); onDone?.(); toast(`Imported ${r.created} proxies`, 'ok'); } }] });
+    <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:10px">
+      <label class="switch"><input type="checkbox" id="impRot"><i></i><span class="mut">mark as rotators</span></label>
+      <label class="switch"><input type="checkbox" id="impCheck" checked><i></i><span class="mut">auto-check on import</span></label>
+      <label class="switch"><input type="checkbox" id="impKeepAlive"><i></i><span class="mut">drop dead ones</span></label>
+    </div>`, actions: [{ label: 'Import', kind: 'primary', onClick: async ({ bodyEl }) => {
+      const r = await api('/api/proxies/import', { method: 'POST', body: {
+        text: bodyEl.querySelector('#impText').value, rotator: bodyEl.querySelector('#impRot').checked,
+        check: bodyEl.querySelector('#impCheck').checked, onlyKeepAlive: bodyEl.querySelector('#impKeepAlive').checked } });
+      await refreshAll(); onDone?.();
+      toast(r.check?.ran ? `Imported ${r.created} · alive ${r.check.alive}/${r.check.checked}` : `Imported ${r.created} proxies`, 'ok');
+    } }] });
+}
+
+// Fetch, parse and auto-check proxies from well-known public proxy-list resources.
+async function fetchFromSources(onDone) {
+  let sources = [];
+  try { sources = (await api('/api/proxies/sources')).sources || []; } catch (e) { return toast('Failed to load sources: ' + e.message, 'err'); }
+  const TYPES = ['http', 'https', 'socks5'];
+  const srcRows = sources.map(s => '<label class="ck" style="display:flex;align-items:center;gap:7px;padding:2px 0"><input type="checkbox" class="src" value="' + s.id + '" checked> ' + App.esc(s.label) + ' <span class="tag" style="margin-left:auto">' + s.type + '</span></label>').join('');
+  const typRows = TYPES.map(t => '<label class="ck"><input type="checkbox" class="typ" value="' + t + '" checked> ' + t + '</label>').join(' ');
+  const body =
+    '<div class="form">' +
+    '<div class="hint">Mirage pulls raw <span class="mono">host:port[:user:pass]</span> lists from community sources, parses them, then verifies each proxy live (exit IP + geo + latency). <b>Free public proxies are shared and unreliable — treat them as disposable, never for accounts you care about.</b></div>' +
+    '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:4px">' +
+      '<div style="flex:1 1 260px"><label>Sources</label><div style="max-height:230px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px">' + srcRows + '</div></div>' +
+      '<div style="flex:1 1 240px"><label>Keep types</label><div style="display:flex;gap:12px;flex-wrap:wrap;padding:4px 0">' + typRows + '</div>' +
+        '<div class="row2" style="margin-top:6px"><div><label>Max to import</label><input id="fsLimit" type="number" value="60" min="1" max="1000"></div><div><label>Probe concurrency</label><input id="fsConc" type="number" value="10" min="1" max="25"></div></div>' +
+        '<label>Also try a custom list URL</label><input id="fsUrl" placeholder="https://example.com/proxies.txt">' +
+        '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:8px"><label class="switch"><input type="checkbox" id="fsCheck" checked><i></i><span class="mut">auto-check</span></label><label class="switch"><input type="checkbox" id="fsKeepAlive"><i></i><span class="mut">only keep alive</span></label></div>' +
+      '</div>' +
+    '</div>' +
+    '<div id="fsResult" style="margin-top:6px"></div>' +
+    '</div>';
+  const actions = [
+    { label: 'Fetch & check', kind: 'primary', onClick: async ({ bodyEl }) => {
+      const picked = [...bodyEl.querySelectorAll('.src:checked')].map(x => x.value);
+      const types = [...bodyEl.querySelectorAll('.typ:checked')].map(x => x.value);
+      const urls = (bodyEl.querySelector('#fsUrl').value.trim() || '').split(/[\s,]+/).filter(Boolean);
+      if (!picked.length && !urls.length) { toast('Select at least one source', 'err'); return true; }
+      if (!types.length) { toast('Pick at least one type', 'err'); return true; }
+      const box = bodyEl.querySelector('#fsResult');
+      box.innerHTML = '<div class="dim"><span class="spin"></span> Fetching lists, parsing and probing proxies… can take up to a minute.</div>';
+      const r = await api('/api/proxies/fetch', { method: 'POST', body: {
+        sources: picked, urls, types,
+        limit: +bodyEl.querySelector('#fsLimit').value || 60,
+        concurrency: +bodyEl.querySelector('#fsConc').value || 10,
+        check: bodyEl.querySelector('#fsCheck').checked,
+        onlyKeepAlive: bodyEl.querySelector('#fsKeepAlive').checked } });
+      await refreshAll(); onDone?.();
+      const per = (r.perSource || []).map(s => App.esc(s.source) + ': ' + s.added + ' added' + (s.error ? ' (' + App.esc(s.error) + ')' : '')).join('<br>');
+      const errs = (r.errors || []).map(App.esc).join('<br>');
+      box.innerHTML = '<div class="kv">' +
+        '<div class="r"><span class="k">Parsed from sources</span><b>' + r.fetched + '</b></div>' +
+        '<div class="r"><span class="k">Imported (new)</span><b>' + r.created + '</b></div>' +
+        (r.check && r.check.ran ? '<div class="r"><span class="k">Checked · alive / dead</span><b class="ok-c">' + r.check.alive + '</b> / <b class="bad-c">' + r.check.dead + '</b></div>' : '') +
+        per + '</div>' + (errs ? '<div class="issue critical" style="margin-top:8px">Source errors:<br>' + errs + '</div>' : '');
+      toast('Imported ' + r.created + (r.check && r.check.ran ? ', ' + r.check.alive + ' alive' : ''), 'ok');
+      return true;
+    } },
+    { label: 'Close', kind: 'ghost', onClick: () => close() },
+  ];
+  const { close, bodyEl } = modal({ title: 'Import from public sources', wide: true, body, actions });
 }
 
 /* ===================== TEAM ===================== */

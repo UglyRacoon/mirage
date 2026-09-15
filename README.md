@@ -210,6 +210,36 @@ node -e "const p=require('playwright-core');(async()=>{ // attach to the *profil
 `GET /api/v1/browser/status`, `POST /api/browser/eval`, `POST /api/checker/run/:id`
 (full in-kernel leak audit via HTTP). Session cookie login for the UI: `POST /api/auth/login {pin}`.
 
+## 3.5 · Proxy sources, auto-check & bulk profile generation
+
+All proxy and fingerprint logic is now reachable both from the UI and the JSON API.
+
+### Proxy import & parsing
+`POST /api/proxies/import` accepts the common formats — `host:port`, `user:pass@host:port`,
+`host:port:user:pass`, `socks5://user:pass@host:port`. Set `check:true` to probe every new
+proxy right after import, and `onlyKeepAlive:true` to drop dead ones.
+
+### Fetch from known public sources (auto-check)
+`GET /api/proxies/sources` lists curated free proxy-list resources. `POST /api/proxies/fetch`
+pulls raw lists, parses them, de-duplicates against existing proxies, and — when `check` is set —
+verifies each one live (exit IP + geo + latency) before storing. The UI exposes this as the
+**"☁ From public sources"** button on the Proxies page. ⚠️ Public free proxies are shared and
+unreliable — treat them as disposable.
+
+### Bulk probe
+`POST /api/proxies/probe-all` probes every stored proxy serverside with a bounded worker pool
+(default concurrency 8). The **"Probe all"** button on the Proxies page uses it.
+
+### Country-targeted bulk profiles
+`POST /api/profiles/generate-bulk {country, count, osList?, browserList?, namePrefix?,
+group_id?, proxy_id?, tags?}` creates N profiles that all share the chosen country
+(timezone, geolocation, languages) while OS, browser, device model, screen and seed vary.
+In the UI this is the **"⚙ Generate a batch for a country"** card on the New-profile page.
+
+> SOCKS5 (and HTTP auth) access path was hardened: the browser connects through a local
+> authenticated relay (no credentials are ever placed in `--proxy-server`), and the relay
+> CONNECT handshake carries a timeout so a dead proxy can never hang a probe.
+
 ## 4 · Honesty section (read this before trusting any anti-detect)
 
 * **TLS/JA3/JA4, HTTP/2 SETTINGS, QUIC are produced by the kernel's network stack** and cannot be

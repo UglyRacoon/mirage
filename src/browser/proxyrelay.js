@@ -80,22 +80,23 @@ function socks5Connect(proxy, host, port) {
         if (chosen === 0x02) { // username/password auth (RFC1929)
           const u = Buffer.from(proxy.user || '', 'utf8'), p = Buffer.from(proxy.pass || '', 'utf8');
           up.write(Buffer.concat([Buffer.from([0x01, u.length]), u, Buffer.from([p.length]), p]));
-          b = Buffer.alloc(0); stage = 1; return;
+          b = b.subarray(2); stage = 1; return;
         }
         if (chosen !== 0x00) { up.destroy(); reject(new Error('socks5 no acceptable method')); return; }
-        b = Buffer.alloc(0); stage = 2; sendReq(); return;
+        b = b.subarray(2); stage = 2; sendReq(); return;
       }
       if (stage === 1) {
         if (b.length < 2) return;
         if (b[1] !== 0x00) { up.destroy(); reject(new Error('socks5 auth failed')); return; }
-        b = Buffer.alloc(0); stage = 2; sendReq(); return;
+        b = b.subarray(2); stage = 2; sendReq(); return;
       }
       if (stage === 2) {
-        if (b.length < 5) return;
-        const atyp = b[3];
-        let need = 5 + (atyp === 1 ? 4 : atyp === 3 ? 1 + b[4] : 16) + 2;
-        if (b.length < need) return;
+        if (b.length < 4) return;
         if (b[1] !== 0x00) { up.destroy(); reject(new Error('socks5 connect refused: 0x' + b[1].toString(16))); return; }
+        const atyp = b[3];
+        const addrLen = atyp === 1 ? 4 : atyp === 3 ? 1 + b[4] : 16;
+        const need = 4 + addrLen + 2; // ver,rep,rsv,atyp (4) + bound-addr + bound-port (2)
+        if (b.length < need) return;
         up.removeListener('data', onData);
         up.setNoDelay(true);
         resolve({ sock: up, head: b.subarray(need) });

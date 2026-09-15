@@ -3,9 +3,13 @@ import os from 'node:os';
 import net from 'node:net';
 import { generateFingerprint, quickTemplates } from './fingerprint/generate.js';
 import { MODELS } from './fingerprint/models.js';
+import { REGIONS } from './fingerprint/pools.js';
 import { auditFingerprint } from './fingerprint/consistency.js';
 import { buildStealthBundle } from './fingerprint/stealth.js';
 import { probeProxy } from './proxy/probe.js';
+import { parseProxyList, proxyKey } from './proxy/parse.js';
+import { listSources, fetchProxies } from './proxy/sources.js';
+import { bulkProbe } from './proxy/checker.js';
 import { parseClientHello } from './net/clienthello.js';
 import { sealDNA, openDNA, dnaThumb } from './fingerprint/dna.js';
 import { uid, now, jparse, signToken, verifyToken, sha256, fmtBytes, sleep } from './util.js';
@@ -85,6 +89,37 @@ export function createApi(ctx) {
       memo: body.memo || '', proxy_id: body.proxy_id || '', inline_proxy: body.inline_proxy || '', fingerprint: fp, settings: body.settings || defaultSettings(), created_at: now(), updated_at: now(), last_open: 0, open_count: 0, owner: authInfo(req)?.member || 'me', browser_dir: '' };
     db.saveProfile(prof); auditLog('audit.profile.create', req, { profileId: id, meta: { name: prof.name, os: fp.osId, browser: fp.browser } });
     ok(res, { profile: publicProfile(db.getProfile(id)) });
+  };
+  H['GET /api/fingerprint/countries'] = (req, res) => ok(res, { countries: Object.keys(REGIONS) });
+
+  // Country-targeted bulk profile generation. Each profile gets a unique seed so the
+  // OS/browser/model/screen/timezone vary, while the country stays pinned. Optional
+  // osList/browserList constrain the device variety; proxy_id attaches a proxy to all.
+  H['POST /api/profiles/generate-bulk'] = (req, res, _p, body) => {
+    if (!canWrite(req, res)) return;
+    const country = String(body.country || '').trim().toUpperCase();
+    if (!country || !REGIONS[country]) return err(res, 400, 'unknown or missing country (see /api/fingerprint/countries)');
+    const count = Math.max(1, Math.min(100, parseInt(body.count || 5) || 5));
+    const osList = Array.isArray(body.osList) ? body.osList.filter(Boolean) : null;
+    const browserList = Array.isArray(body.browserList) ? body.browserList.filter(Boolean) : null;
+    const prefix = (body.namePrefix || country || 'Batch');
+    const group_id = body.group_id || '';
+    const proxy_id = body.proxy_id || '';
+    const tags = Array.isArray(body.tags) ? body.tags.map(String) : (body.tags ? String(body.tags).split(',').map(s => s.trim()).filter(Boolean) : []);
+    const created = [];
+    for (let i = 0; i < count; i++) {
+      const seed = uid(10) + '-' + i;
+      const os = osList ? osList[i % osList.length] : undefined;
+      const browser = browserList ? browserList[i % browserList.length] : undefined;
+      const fp = generateFingerprint({ country, os, browser, seed, variant: body.forceVariant ? (i % 3) : undefined });
+      const id = uid(10);
+      const name = `${prefix} · ${fp.browserLabel || fp.browser} · ${String(i + 1).padStart(2, '0')}`;
+      db.saveProfile({ id, name, group_id, color: body.color || '', favorite: false, tags, memo: body.memo || '',
+        proxy_id, inline_proxy: '', fingerprint: fp, settings: defaultSettings(), created_at: now(), updated_at: now(), last_open: 0, open_count: 0, owner: authInfo(req)?.member || 'me', browser_dir: '' });
+      created.push(publicProfile(db.getProfile(id)));
+    }
+    auditLog('audit.profiles.generate_bulk', req, { meta: { country, count: created.length } });
+    ok(res, { created: created.length, country, profiles: created });
   };
   H['PUT /api/profiles/:id'] = (req, res, p, body) => {
     if (!canWrite(req, res)) return;
@@ -223,25 +258,59 @@ export function createApi(ctx) {
   H['DELETE /api/proxies/:id'] = (req, res, p) => { if (!canWrite(req, res)) return; db.deleteProxy(p.id); ok(res, { ok: true }); };
   H['POST /api/proxies/test'] = async (req, res, _p, body) => { const r = await probeProxy({ scheme: (body.scheme || 'http').toLowerCase(), host: body.host, port: body.port, user: body.user, pass: body.pass }); json(res, r.ok ? 200 : 200, r); };
   H['POST /api/proxies/:id/probe'] = async (req, res, p) => { const px = db.getProxy(p.id); if (!px) return err(res, 404, 'not found'); const r = await probeProxy(px); if (r.ok) db.saveProxy({ ...px, last_check: JSON.stringify(r) }); ok(res, r); };
+  // dedupe helpers for proxy import/fetch
+  const existingProxyKeys = () => { const s = new Set(); for (const p of db.listProxies()) s.add(proxyKey(p)); return s; };
+  function saveProxiesDedup(parsed, { labelPrefix = '', country = '', rotator = 0, note = '', seen = null } = {}) {
+    const set = seen || existingProxyKeys();
+    const created = [];
+    for (const p of parsed) {
+      const k = proxyKey(p); if (set.has(k)) continue; set.add(k);
+      const rec = db.saveProxy({
+        scheme: p.scheme, host: p.host, port: p.port, user: p.user, pass: p.pass,
+        label: labelPrefix ? `${labelPrefix} ${p.host}:${p.port}` : `${p.host}:${p.port}`,
+        country: p.country || country, city: p.city || '', note: p.source ? ('src:' + p.source) : note, rotator,
+      });
+      created.push(rec);
+    }
+    return created;
+  }
+  async function verifyAndStore(created, { concurrency = 8, onlyKeepAlive = false } = {}) {
+    if (!created.length) return { ran: true, checked: 0, alive: 0, dead: 0 };
+    const { results, alive, dead } = await bulkProbe(created, { concurrency });
+    for (const { proxy, result } of results) {
+      try { if (result && result.ok) db.saveProxy({ ...proxy, last_check: JSON.stringify(result) }); else if (onlyKeepAlive) db.deleteProxy(proxy.id); else db.saveProxy({ ...proxy, last_check: JSON.stringify(result) }); } catch (e) { }
+    }
+    return { ran: true, checked: results.length, alive, dead };
+  }
+
   H['POST /api/proxies/import'] = async (req, res, _p, body) => {
     if (!canWrite(req, res)) return;
-    const text = body.text || ''; const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    const created = [];
-    for (const line of lines) {
-      let scheme = (body.defaultScheme || 'http').toLowerCase(), user = '', pass = '', host = '', port = 0;
-      let m = line.match(/^(socks5h|socks5|socks|https|http):\/\/(?:([^:@/]+)(?::([^@/]*))?@)?([^:/]+):(\d+)/i);
-      if (m) {
-        scheme = m[1].toLowerCase(); if (scheme.startsWith('socks')) scheme = 'socks5';
-        user = m[2] || ''; pass = m[3] || ''; host = m[4]; port = +m[5];
-      } else {
-        m = line.match(/^(?:([^:@\s]+):([^@\s]+)@)?([^:\s]+):(\d+)(?::(socks5|http|https))?$/i);
-        if (m) { user = m[1] || ''; pass = m[2] || ''; host = m[3]; port = +m[4]; if (m[5]) scheme = m[5].toLowerCase(); }
-      }
-      if (!host || !port) continue;
-      const rec = db.saveProxy({ scheme, host, port, user, pass, label: `${host}:${port}`, rotator: body.rotator ? 1 : 0 });
-      created.push({ ...rec, pass: undefined });
-    }
-    ok(res, { created: created.length, proxies: created });
+    const created = saveProxiesDedup(parseProxyList(body.text || ''), { country: body.country || '', rotator: body.rotator ? 1 : 0, note: 'imported' });
+    const check = body.check ? await verifyAndStore(created, { concurrency: +(body.concurrency || 8), onlyKeepAlive: !!body.onlyKeepAlive }) : { ran: false };
+    ok(res, { created: created.length, check, proxies: created.map(c => ({ ...c, pass: undefined })) });
+  };
+
+  // Known public proxy-list resources (raw text). Lets the UI offer one-click "fetch & check".
+  H['GET /api/proxies/sources'] = (req, res) => ok(res, { sources: listSources() });
+
+  H['POST /api/proxies/fetch'] = async (req, res, _p, body) => {
+    if (!canWrite(req, res)) return;
+    const { proxies, perSource, errors } = await fetchProxies({
+      sources: body.sources || [], urls: body.urls || [], types: body.types || null, limit: Math.min(1000, +(body.limit || 200)),
+    });
+    const created = saveProxiesDedup(proxies, { note: 'fetched' });
+    const check = body.check === false ? { ran: false } : await verifyAndStore(created.slice(0, Math.min(created.length, +(body.checkLimit || 250))), { concurrency: +(body.concurrency || 10), onlyKeepAlive: !!body.onlyKeepAlive });
+    ok(res, { fetched: proxies.length, created: created.length, perSource, errors, check });
+  };
+
+  // Server-side bulk probe of stored proxies (fast, bounded concurrency).
+  H['POST /api/proxies/probe-all'] = async (req, res, _p, body) => {
+    if (!canWrite(req, res)) return;
+    const all = db.listProxies();
+    const targets = Array.isArray(body.ids) && body.ids.length ? all.filter(p => body.ids.includes(p.id)) : all;
+    const { results, alive, dead } = await bulkProbe(targets, { concurrency: +(body.concurrency || 8) });
+    for (const { proxy, result } of results) { try { db.saveProxy({ ...proxy, last_check: JSON.stringify(result) }); } catch (e) { } }
+    ok(res, { total: targets.length, alive, dead });
   };
 
   // ---------------- browser sessions ----------------
