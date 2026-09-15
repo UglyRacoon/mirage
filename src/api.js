@@ -256,6 +256,19 @@ export function createApi(ctx) {
   H['POST /api/proxies'] = (req, res, _p, body) => { if (!canWrite(req, res)) return; const pr = db.saveProxy({ id: body.id, label: body.label, scheme: (body.scheme || 'http').toLowerCase(), host: body.host, port: body.port, user: body.user, pass: body.pass, country: body.country || '', city: body.city || '', note: body.note || '', rotator: body.rotator }); ok(res, { proxy: pr }); };
   H['PUT /api/proxies/:id'] = (req, res, p, body) => { if (!canWrite(req, res)) return; const cur = db.getProxy(p.id); if (!cur) return err(res, 404, 'not found'); const merged = { ...cur, ...body, id: cur.id }; db.saveProxy(merged); ok(res, { proxy: db.getProxy(p.id) }); };
   H['DELETE /api/proxies/:id'] = (req, res, p) => { if (!canWrite(req, res)) return; db.deleteProxy(p.id); ok(res, { ok: true }); };
+  // Bulk operations: multi-select delete + favorites (pin/unpin) for quick access.
+  H['POST /api/proxies/bulk'] = (req, res, _p, body) => {
+    if (!canWrite(req, res)) return;
+    const ids = Array.isArray(body.ids) ? body.ids.filter(x => typeof x === 'string') : [];
+    if (!ids.length) return err(res, 400, 'no ids');
+    if (body.action === 'delete') { db.deleteProxies(ids); return ok(res, { ok: true, deleted: ids.length }); }
+    if (body.action === 'favorite' || body.action === 'unfavorite') {
+      const val = body.action === 'favorite' ? 1 : 0; ids.forEach(id => db.setProxyFavorite(id, val)); return ok(res, { ok: true });
+    }
+    return err(res, 400, 'unknown action');
+  };
+  H['DELETE /api/proxies'] = (req, res) => { if (!canWrite(req, res)) return; const n = db.countProxiesInUse(); db.clearProxies(); ok(res, { ok: true, inUse: n }); };
+
   H['POST /api/proxies/test'] = async (req, res, _p, body) => { const r = await probeProxy({ scheme: (body.scheme || 'http').toLowerCase(), host: body.host, port: body.port, user: body.user, pass: body.pass }); json(res, r.ok ? 200 : 200, r); };
   H['POST /api/proxies/:id/probe'] = async (req, res, p) => { const px = db.getProxy(p.id); if (!px) return err(res, 404, 'not found'); const r = await probeProxy(px); if (r.ok) db.saveProxy({ ...px, last_check: JSON.stringify(r) }); ok(res, r); };
   // dedupe helpers for proxy import/fetch
@@ -421,7 +434,14 @@ export function createApi(ctx) {
     const kernel = await bm.status();
     ok(res, { settings: st, kernel, me: m ? { id: m.id, name: m.name, role: m.role } : null });
   };
-  H['PUT /api/settings'] = (req, res, _p, body) => { if (!need(req, res, ['admin'])) return; setSettings({ ...getSettings(), ...body }); ok(res, { ok: true, settings: getSettings() }); };
+  // A lone `lang` key is a UI preference — allowed for any signed-in member; everything else is admin-only.
+  H['PUT /api/settings'] = (req, res, _p, body) => {
+    const keys = Object.keys(body || {});
+    const langOnly = keys.length && keys.every(k => k === 'lang');
+    if (!langOnly && !need(req, res, ['admin'])) return;
+    if (body.lang && body.lang !== 'ru' && body.lang !== 'en') delete body.lang;
+    setSettings({ ...getSettings(), ...body }); ok(res, { ok: true, settings: getSettings() });
+  };
 
   // ---------------- events / history ----------------
   H['GET /api/events'] = (req, res) => { const q = new URL(req.url, 'http://x').searchParams; ok(res, { events: db.listEvents(Math.min(+q.get('limit') || 100, 500), q.get('type') || '') }); };

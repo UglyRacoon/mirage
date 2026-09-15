@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS groups ( id TEXT PRIMARY KEY, name TEXT, color TEXT D
 CREATE TABLE IF NOT EXISTS proxies (
   id TEXT PRIMARY KEY, label TEXT, scheme TEXT, host TEXT, port INTEGER, user TEXT DEFAULT '', pass TEXT DEFAULT '',
   country TEXT DEFAULT '', city TEXT DEFAULT '', note TEXT DEFAULT '', rotator INTEGER DEFAULT 0,
-  last_check TEXT DEFAULT '', created_at INTEGER
+  last_check TEXT DEFAULT '', created_at INTEGER, favorite INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS members ( id TEXT PRIMARY KEY, name TEXT, email TEXT DEFAULT '', role TEXT DEFAULT 'member',
   pin_hash TEXT DEFAULT '', color TEXT DEFAULT '#8b5cf6', active INTEGER DEFAULT 1, created_at INTEGER );
@@ -40,6 +40,7 @@ export function initDb(dir) {
   db = new DatabaseSync(path.join(dir, 'mirage.db'));
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec(SCHEMA);
+  try { db.exec('ALTER TABLE proxies ADD COLUMN favorite INTEGER DEFAULT 0'); } catch (_) { /* already present */ }
   seedIfEmpty();
   return db;
 }
@@ -94,18 +95,23 @@ export function saveGroup(g) {
 export function deleteGroup(id) { db.prepare('DELETE FROM groups WHERE id=?').run(id); db.prepare("UPDATE profiles SET group_id='' WHERE group_id=?").run(id); }
 
 // ---------- proxies ----------
-export function listProxies() { return db.prepare('SELECT * FROM proxies ORDER BY created_at DESC').all(); }
+export function listProxies() { return db.prepare('SELECT * FROM proxies ORDER BY favorite DESC, created_at DESC').all(); }
 export function getProxy(id) { return db.prepare('SELECT * FROM proxies WHERE id=?').get(id) || null; }
 export function saveProxy(px) {
   const id = px.id || uid(10);
-  db.prepare(`INSERT INTO proxies (id,label,scheme,host,port,user,pass,country,city,note,rotator,last_check,created_at)
-    VALUES (@id,@label,@scheme,@host,@port,@user,@pass,@country,@city,@note,@rotator,@last_check,@created_at)
-    ON CONFLICT(id) DO UPDATE SET label=@label,scheme=@scheme,host=@host,port=@port,user=@user,pass=@pass,country=@country,city=@city,note=@note,rotator=@rotator,last_check=@last_check`)
+  db.prepare(`INSERT INTO proxies (id,label,scheme,host,port,user,pass,country,city,note,rotator,last_check,created_at,favorite)
+    VALUES (@id,@label,@scheme,@host,@port,@user,@pass,@country,@city,@note,@rotator,@last_check,@created_at,@favorite)
+    ON CONFLICT(id) DO UPDATE SET label=@label,scheme=@scheme,host=@host,port=@port,user=@user,pass=@pass,country=@country,city=@city,note=@note,rotator=@rotator,last_check=@last_check,favorite=@favorite`)
     .run({ id, label: px.label || `${px.host}:${px.port}`, scheme: px.scheme || 'http', host: px.host, port: +px.port, user: px.user || '', pass: px.pass || '',
-      country: px.country || '', city: px.city || '', note: px.note || '', rotator: px.rotator ? 1 : 0, last_check: px.last_check || '', created_at: px.created_at || now() });
+      country: px.country || '', city: px.city || '', note: px.note || '', rotator: px.rotator ? 1 : 0, last_check: px.last_check || '',
+      created_at: px.created_at || now(), favorite: px.favorite ? 1 : 0 });
   return db.prepare('SELECT * FROM proxies WHERE id=?').get(id);
 }
+export function setProxyFavorite(id, val) { db.prepare('UPDATE proxies SET favorite=? WHERE id=?').run(val ? 1 : 0, id); }
 export function deleteProxy(id) { db.prepare('DELETE FROM proxies WHERE id=?').run(id); db.prepare("UPDATE profiles SET proxy_id='' WHERE proxy_id=?").run(id); }
+export function deleteProxies(ids) { for (const id of ids) deleteProxy(id); }
+export function clearProxies() { const all = db.prepare('SELECT id FROM proxies').all(); for (const r of all) deleteProxy(r.id); }
+export function countProxiesInUse() { return db.prepare('SELECT COUNT(*) AS n FROM profiles WHERE proxy_id<>?').get('').n; }
 
 // ---------- members ----------
 export function listMembers() { return db.prepare('SELECT * FROM members ORDER BY created_at').all().map(m => ({ ...m, pin_hash: undefined })); }

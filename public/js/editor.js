@@ -477,18 +477,20 @@ async function auditNow() {
 /* ---------- identity regenerate modal ---------- */
 function identityModal(id) {
   const fp = Ed.fp || {};
-  modal({ title: 'Generate new identity', body: `
+  const m = modal({ title: 'Generate new identity', body: `
     <div class="form">
       <div class="row3">
         <div><label>OS</label><select id="rgOs">${[['windows-11', 'Win 11'], ['windows-10', 'Win 10'], ['macos-sequoia', 'Sequoia'], ['macos-sonoma', 'Sonoma'], ['ubuntu-2404', 'Ubuntu'], ['android-14', 'Android 14'], ['ios-17', 'iOS 17']].map(o => `<option value="${o[0]}" ${(fp.os?.id || '') === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select></div>
         <div><label>Browser</label><select id="rgBr">${['chrome', 'edge', 'firefox', 'safari'].map(b => `<option ${fp.browser === b ? 'selected' : ''}>${b}</option>`).join('')}</select></div>
         <div><label>Country</label><input id="rgC" value="${App.esc(fp.meta?.region || '')}" placeholder="US" maxlength="2"></div>
       </div>
-      <div><label>Seed</label><div style="display:flex;gap:8px"><input id="rgSeed" class="mono" value="${App.esc(fp.seed || '')}"><button class="btn sm" id="rgDice">⚄ new</button></div>
-      <div class="hint">Same seed + os/browser = identical fingerprint — keep seed to stay "the same person" across team changes.</div></div>
+      <div><label>Seed</label><div style="display:flex;gap:8px"><input id="rgSeed" class="mono" placeholder="auto — new random identity" value=""><button class="btn sm" id="rgDice">⚄ new</button></div>
+      <div class="hint">Leaving Seed blank generates a brand-new random identity every time. Set a seed only to reproduce an exact identity (same seed + os/browser = same fingerprint).</div></div>
       <p class="warn-c" style="font-size:12.5px">⚠ A brand-new identity on an old profile's cookies is a risk signal for ad platforms. Regenerate when starting fresh or rotating.</p>
     </div>`, actions: [
       { label: 'Preview only', onClick: ({ bodyEl }) => guard(async () => { const r = await api('/api/fingerprint/generate', { method: 'POST', body: { os: bodyEl.querySelector('#rgOs').value, browser: bodyEl.querySelector('#rgBr').value, country: bodyEl.querySelector('#rgC').value, seed: bodyEl.querySelector('#rgSeed').value } }); modal({ title: 'Generated fingerprint', body: `<pre class="code" style="max-height:480px">${App.esc(JSON.stringify(r.fingerprint, null, 2))}</pre>`, actions: [{ label: 'Close' }] }); return true; }) },
       { label: 'Apply to profile', kind: 'primary', onClick: ({ bodyEl }) => guard(async () => { await api(`/api/profiles/${id}/regenerate`, { method: 'POST', body: { os: bodyEl.querySelector('#rgOs').value, browser: bodyEl.querySelector('#rgBr').value, country: bodyEl.querySelector('#rgC').value, seed: bodyEl.querySelector('#rgSeed').value || undefined } }); await refreshAll(); toast('New identity applied', 'ok'); go('#/profiles/' + id); rerender(); }) },
     ] });
+  const dice = m.bodyEl.querySelector('#rgDice'), seed = m.bodyEl.querySelector('#rgSeed');
+  if (dice && seed) dice.onclick = () => { seed.value = 'x' + Math.random().toString(36).slice(2, 12); seed.focus(); };
 }

@@ -78,7 +78,6 @@ ROUTES.profiles = (view) => {
     <select id="pgroup" style="width:160px"><option value="">All groups</option>${groups.map(g => `<option ${pfilter.group === g.id ? 'selected' : ''} value="${g.id}">${App.esc(g.name)}</option>`).join('')}</select>
     <label class="switch"><input type="checkbox" id="pfav" ${pfilter.fav ? 'checked' : ''}><i></i><span class="mut">Favorites</span></label>
     <div class="seg"><button id="gmGrid" class="${pfilter.mode === 'grid' ? 'on' : ''}">▦</button><button id="gmList" class="${pfilter.mode === 'list' ? 'on' : ''}">☰</button></div>
-    <button class="btn primary" id="pNew">+ New profile</button>
   </div>
   <div id="pBulk" class="bulkbar hidden">
     <b id="pBulkN">0</b><span class="mut">selected</span><div class="grow" style="flex:1"></div>
@@ -122,7 +121,6 @@ ROUTES.profiles = (view) => {
   document.getElementById('pfav').onchange = e => { pfilter.fav = e.target.checked; draw(); };
   document.getElementById('gmGrid').onclick = () => { pfilter.mode = 'grid'; draw(); document.getElementById('gmGrid').classList.add('on'); document.getElementById('gmList').classList.remove('on'); };
   document.getElementById('gmList').onclick = () => { pfilter.mode = 'list'; draw(); document.getElementById('gmList').classList.add('on'); document.getElementById('gmGrid').classList.remove('on'); };
-  document.getElementById('pNew').onclick = () => go('#/profiles/new');
   draw();
 };
 function profileCard(p) {
@@ -312,62 +310,127 @@ function newProfileWizard(view) {
       proxy_id: val('wBatchProxy'), tags: (val('wBatchTags') || '').split(',').map(s => s.trim()).filter(Boolean),
       forceVariant: document.getElementById('wBatchVariant').checked } });
     await refreshAll();
-    out.innerHTML = `<div class="issue info">✓ Created <b>${r.created}</b> ${App.esc(r.country)} profiles with varied fingerprints. <span class="link" style="cursor:pointer" onclick="go('#/profiles')">View profiles →</span></div>`;
+    out.innerHTML = '✓ Created ' + r.created + ' ' + App.esc(r.country) + ' profiles with varied fingerprints. '
+      + '<span class="link" style="cursor:pointer" onclick="go(\'#/profiles\')">View profiles →</span>';
+    out.className = 'issue info';
     toast(`Generated ${r.created} profiles`, 'ok');
   });
 }
 
 /* ===================== PROXIES ===================== */
+const xfilter = { q: '', fav: false };
+const xsel = new Set();
 ROUTES.proxies = (view) => {
   view.innerHTML = `
   <div class="toolbar">
-    <div class="search grow"><input id="xq" placeholder="search host, label, city…"></div>
+    <div class="search grow"><input id="xq" placeholder="search host, label, city…" value="${App.esc(xfilter.q)}"></div>
+    <label class="switch"><input type="checkbox" id="xFav" ${xfilter.fav ? 'checked' : ''}><i></i><span class="mut">★ Favorites</span></label>
     <button class="btn" id="xProbeAll">⇅ Probe all</button>
     <button class="btn ghost" id="xImport">⤒ Bulk import</button>
     <button class="btn ghost" id="xSources">☁ From public sources</button>
+    <button class="btn danger" id="xClearAll">✕ Delete all</button>
     <button class="btn primary" id="xAdd">+ Add proxy</button>
   </div>
-  <div class="card" style="padding:6px 10px"><table class="tbl"><thead><tr>
-    <th>Label</th><th>Endpoint</th><th class="hide-sm">Scheme</th><th class="hide-sm">Geo (last probe)</th><th>Exit IP</th><th class="hide-sm">Latency</th><th>Used by</th><th></th></tr></thead><tbody id="xRows"></tbody></table></div>
+  <div id="xBulk" class="bulkbar hidden">
+    <b id="xBulkN">0</b><span class="mut">selected</span><div class="grow" style="flex:1"></div>
+    <button class="btn sm" data-xb="favorite">★ Favorite</button>
+    <button class="btn sm ghost" data-xb="unfavorite">★ Unfavorite</button>
+    <button class="btn sm danger" data-xb="delete">Delete selected</button>
+    <button class="btn sm ghost" data-xb="clear">Clear selection</button>
+  </div>
+  <div class="card tblwrap" style="padding:6px 10px"><table class="tbl"><thead><tr>
+    <th style="width:28px"><input type="checkbox" id="xckAll" style="width:auto" title="Select all"></th>
+    <th style="width:28px"></th><th>Label</th><th>Endpoint</th><th class="hide-sm">Scheme</th><th class="hide-sm">Geo (last probe)</th><th>Exit IP</th><th class="hide-sm">Latency</th><th>Used by</th><th></th></tr></thead><tbody id="xRows"></tbody></table></div>
   <div class="hint" style="margin-top:10px">Mirage routes the kernel through a local relay that adds Proxy-Authorization — HTTP(S) and SOCKS5 with auth all work. TLS/JA3 fingerprints belong to the real kernel and are shared per-binary (see docs).</div>`;
   const draw = () => {
-    const q = (val('xq') || '').toLowerCase();
-    const rows = App.state.proxies.filter(px => !q || [px.label, px.host, px.city, px.country].join(' ').toLowerCase().includes(q));
+    const q = (xfilter.q || '').toLowerCase();
+    const rows = App.state.proxies.filter(px => {
+      if (xfilter.fav && !px.favorite) return false;
+      if (!q) return true;
+      return [px.label, px.host, px.city, px.country, px.scheme].join(' ').toLowerCase().includes(q);
+    });
     document.getElementById('xRows').innerHTML = rows.length ? rows.map(px => {
       const chk = safeParse(px.last_check);
       const used = App.state.profiles.filter(p => p.proxy_id === px.id).length;
-      return `<tr data-id="${px.id}">
-        <td><b>${App.esc(px.label || '—')}</b>${px.rotator ? ' <span class="tag">rotator</span>' : ''}</td>
-        <td class="mono">${App.esc(px.host)}:${px.port}${px.user ? ` <span class="dim">/ ${App.esc(px.user)}</span>` : ''}</td>
-        <td><span class="tag">${App.esc(px.scheme)}</span></td>
-        <td class="hide-sm">${chk?.ok ? App.esc([chk.geo?.country, chk.geo?.city].filter(Boolean).join(', ') || '—') : '<span class="dim">not probed</span>'} ${chk?.ok && chk.geo ? `<div class="dim mono" style="font-size:10.5px">${App.esc(chk.geo.isp || '')} ${chk.geo.hosting ? '· <span class="warn-c">hosting</span>' : ''}</div>` : ''}</td>
-        <td class="mono">${chk?.ok ? App.esc(chk.exitIp) : chk && !chk.ok ? `<span class="bad-c" title="${App.esc(chk.error || '')}">fail</span>` : '—'}</td>
-        <td class="mono hide-sm">${chk?.ok ? chk.latencyMs + 'ms' : '—'}</td>
-        <td>${used ? `<span class="tag">${used} profile(s)</span>` : '<span class="dim">—</span>'}</td>
-        <td style="text-align:right;white-space:nowrap">
-          <button class="btn sm" data-act="probe">⇅ Test</button>
-          <button class="btn sm ghost" data-act="edit">✎</button>
-          <button class="btn sm ghost" data-act="del">🗑</button></td></tr>`;
-    }).join('') : `<tr><td colspan="8"><div class="empty">No proxies. Add one or bulk-import.</div></td></tr>`;
+      const geo = chk?.ok ? App.esc([chk.geo?.country, chk.geo?.city].filter(Boolean).join(', ') || '—') : '<span class="dim">not probed</span>';
+      const isp = chk?.ok && chk.geo ? '<div class="dim mono" style="font-size:10.5px">' + App.esc(chk.geo.isp || '') + (chk.geo.hosting ? ' · <span class="warn-c">HOSTING</span>' : '') + '</div>' : '';
+      const exit = chk?.ok ? App.esc(chk.exitIp) : (chk && !chk.ok ? '<span class="bad-c" title="' + App.esc(chk.error || '') + '">fail</span>' : '—');
+      return '<tr data-id="' + px.id + '" class="' + (px.favorite ? 'favrow' : '') + '">'
+        + '<td><input type="checkbox" class="xck" ' + (xsel.has(px.id) ? 'checked' : '') + ' style="width:auto"></td>'
+        + '<td><button class="favstar ' + (px.favorite ? 'on' : '') + '" data-act="fav" title="' + (px.favorite ? 'Unpin from favorites' : 'Pin to favorites') + '">' + (px.favorite ? '★' : '☆') + '</button></td>'
+        + '<td><b>' + App.esc(px.label || '—') + '</b>' + (px.rotator ? ' <span class="tag">rotator</span>' : '') + '</td>'
+        + '<td class="mono">' + App.esc(px.host) + ':' + px.port + (px.user ? ' <span class="dim">/ ' + App.esc(px.user) + '</span>' : '') + '</td>'
+        + '<td><span class="tag">' + App.esc(px.scheme) + '</span></td>'
+        + '<td class="hide-sm">' + geo + isp + '</td>'
+        + '<td class="mono">' + exit + '</td>'
+        + '<td class="mono hide-sm xlat">' + (chk?.ok ? chk.latencyMs + 'ms' : '—') + '</td>'
+        + '<td>' + (used ? '<span class="tag">' + used + ' profile(s)</span>' : '<span class="dim">—</span>') + '</td>'
+        + '<td style="text-align:right;white-space:nowrap">'
+        + '<button class="btn sm" data-act="probe">⇅ Test</button> '
+        + '<button class="btn sm ghost" data-act="edit">✎</button> '
+        + '<button class="btn sm ghost" data-act="del">🗑</button></td></tr>';
+    }).join('') : '<tr><td colspan="10"><div class="empty">' + (xfilter.fav ? 'No favorites yet — click ☆ on a proxy.' : 'No proxies. Add one or bulk-import.') + '</div></td></tr>';
+    const all = document.getElementById('xckAll');
+    if (all) { all.checked = rows.length > 0 && rows.every(px => xsel.has(px.id)); all.indeterminate = !all.checked && rows.some(px => xsel.has(px.id)); }
+    syncXBulk();
   };
-  document.getElementById('xq').oninput = draw;
+  const syncXBulk = () => {
+    const bar = document.getElementById('xBulk'); if (!bar) return;
+    const n = xsel.size; bar.classList.toggle('hidden', !n); document.getElementById('xBulkN').textContent = n;
+  };
+  const xbulk = act => {
+    const ids = Array.from(xsel);
+    if (act === 'clear') { xsel.clear(); draw(); return; }
+    if (!ids.length) return toast('No proxies selected', 'err');
+    if (act === 'delete') return confirmDlg('Delete proxies', 'Delete ' + ids.length + ' selected proxies? Profiles using them fall back to direct.', async () => {
+      await api('/api/proxies/bulk', { method: 'POST', body: { ids, action: 'delete' } });
+      xsel.clear(); await refreshAll(); draw(); toast('Proxies deleted', 'ok');
+    });
+    guard(async () => {
+      await api('/api/proxies/bulk', { method: 'POST', body: { ids, action: act } });
+      await refreshAll(); draw(); toast(act === 'favorite' ? 'Pinned to favorites' : 'Removed from favorites', 'ok');
+    });
+  };
+  document.getElementById('xq').oninput = e => { xfilter.q = e.target.value; draw(); };
+  document.getElementById('xFav').onchange = e => { xfilter.fav = e.target.checked; draw(); };
+  document.getElementById('xckAll').onchange = e => {
+    xsel.clear();
+    if (e.target.checked) document.querySelectorAll('#xRows .xck').forEach(c => { const id = c.closest('tr')?.dataset.id; if (id) xsel.add(id); });
+    draw();
+  };
+  document.getElementById('xBulk').onclick = e => { const b = e.target.closest('[data-xb]'); if (b) xbulk(b.dataset.xb); };
+  document.getElementById('xRows').onchange = e => {
+    if (!e.target.classList.contains('xck')) return;
+    const id = e.target.closest('tr')?.dataset.id; if (!id) return;
+    e.target.checked ? xsel.add(id) : xsel.delete(id); syncXBulk();
+  };
   document.getElementById('xRows').onclick = e => {
     const tr = e.target.closest('tr[data-id]'); if (!tr) return; const px = App.state.proxies.find(x => x.id === tr.dataset.id); if (!px) return;
     const b = e.target.closest('[data-act]'); if (!b) return;
-    if (b.dataset.act === 'probe') { tr.querySelectorAll('td')[5].innerHTML = '<span class="spin"></span>'; guard(async () => { const r = await api(`/api/proxies/${px.id}/probe`, { method: 'POST', body: {} }); await refreshAll(); draw(); r.ok ? toast(`${px.host}: exit ${r.exitIp} (${r.latencyMs}ms)`, 'ok') : toast('probe failed: ' + r.error, 'err'); }); }
-    if (b.dataset.act === 'edit') proxyForm(px);
-    if (b.dataset.act === 'del') confirmDlg('Delete proxy', `Remove ${px.host}:${px.port}?`, async () => { await api('/api/proxies/' + px.id, { method: 'DELETE' }); await refreshAll(); draw(); });
+    if (b.dataset.act === 'fav') return guard(async () => { await api('/api/proxies/bulk', { method: 'POST', body: { ids: [px.id], action: px.favorite ? 'unfavorite' : 'favorite' } }); await refreshAll(); draw(); });
+    if (b.dataset.act === 'probe') {
+      const cell = tr.querySelector('.xlat'); if (cell) cell.innerHTML = '<span class="spin"></span>';
+      guard(async () => { const r = await api('/api/proxies/' + px.id + '/probe', { method: 'POST', body: {} }); await refreshAll(); draw(); r.ok ? toast(px.host + ': exit ' + r.exitIp + ' (' + r.latencyMs + 'ms)', 'ok') : toast('probe failed: ' + r.error, 'err'); });
+    }
+    if (b.dataset.act === 'edit') proxyForm(px, draw);
+    if (b.dataset.act === 'del') confirmDlg('Delete proxy', 'Remove this proxy?', async () => { xsel.delete(px.id); await api('/api/proxies/' + px.id, { method: 'DELETE' }); await refreshAll(); draw(); });
   };
   document.getElementById('xAdd').onclick = () => proxyForm(null, draw);
   document.getElementById('xImport').onclick = () => importProxies(draw);
   document.getElementById('xSources').onclick = () => fetchFromSources(draw);
+  document.getElementById('xClearAll').onclick = () => {
+    if (!App.state.proxies.length) return toast('No proxies to probe', 'err');
+    confirmDlg('Delete all proxies', 'This removes every proxy from the library. Profiles that use one fall back to direct. Continue?', async () => {
+      await api('/api/proxies', { method: 'DELETE' }); xsel.clear(); await refreshAll(); draw(); toast('Proxies deleted', 'ok');
+    });
+  };
   document.getElementById('xProbeAll').onclick = () => guard(async () => {
     if (!App.state.proxies.length) return toast('No proxies to probe', 'err');
     toast('Probing all proxies…');
     document.getElementById('xProbeAll').disabled = true;
     try {
       const r = await api('/api/proxies/probe-all', { method: 'POST', body: { concurrency: 10 } });
-      await refreshAll(); draw(); toast(`Probe complete · ${r.alive} alive / ${r.dead} dead`, r.alive ? 'ok' : 'err');
+      await refreshAll(); draw(); toast('Probe complete · ' + r.alive + ' alive / ' + r.dead + ' dead', r.alive ? 'ok' : 'err');
     } finally { const b = document.getElementById('xProbeAll'); if (b) b.disabled = false; }
   });
   draw();
@@ -424,22 +487,39 @@ async function fetchFromSources(onDone) {
   let sources = [];
   try { sources = (await api('/api/proxies/sources')).sources || []; } catch (e) { return toast('Failed to load sources: ' + e.message, 'err'); }
   const TYPES = ['http', 'https', 'socks5'];
-  const srcRows = sources.map(s => '<label class="ck" style="display:flex;align-items:center;gap:7px;padding:2px 0"><input type="checkbox" class="src" value="' + s.id + '" checked> ' + App.esc(s.label) + ' <span class="tag" style="margin-left:auto">' + s.type + '</span></label>').join('');
-  const typRows = TYPES.map(t => '<label class="ck"><input type="checkbox" class="typ" value="' + t + '" checked> ' + t + '</label>').join(' ');
+  // ordered: by type, then A→Z by label — rendered in one aligned grid (no wrapping flow)
+  const sorted = sources.slice().sort((a, b) => String(a.type).localeCompare(String(b.type)) || String(a.label).localeCompare(String(b.label)));
+  const rows = [];
+  let lastType = null;
+  for (const s of sorted) {
+    if (s.type !== lastType) { rows.push('<div class="srcgroup">' + App.esc(String(s.type).toUpperCase()) + '</div>'); lastType = s.type; }
+    rows.push('<input type="checkbox" class="src" id="src-' + App.esc(s.id) + '" value="' + App.esc(s.id) + '" checked>'
+      + '<label class="sname" for="src-' + App.esc(s.id) + '" title="' + App.esc(s.url) + '">' + App.esc(s.label) + '</label>'
+      + '<span class="tag stype">' + App.esc(s.type) + '</span>');
+  }
   const body =
     '<div class="form">' +
-    '<div class="hint">Mirage pulls raw <span class="mono">host:port[:user:pass]</span> lists from community sources, parses them, then verifies each proxy live (exit IP + geo + latency). <b>Free public proxies are shared and unreliable — treat them as disposable, never for accounts you care about.</b></div>' +
-    '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:4px">' +
-      '<div style="flex:1 1 260px"><label>Sources</label><div style="max-height:230px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px">' + srcRows + '</div></div>' +
-      '<div style="flex:1 1 240px"><label>Keep types</label><div style="display:flex;gap:12px;flex-wrap:wrap;padding:4px 0">' + typRows + '</div>' +
-        '<div class="row2" style="margin-top:6px"><div><label>Max to import</label><input id="fsLimit" type="number" value="60" min="1" max="1000"></div><div><label>Probe concurrency</label><input id="fsConc" type="number" value="10" min="1" max="25"></div></div>' +
-        '<label>Also try a custom list URL</label><input id="fsUrl" placeholder="https://example.com/proxies.txt">' +
-        '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:8px"><label class="switch"><input type="checkbox" id="fsCheck" checked><i></i><span class="mut">auto-check</span></label><label class="switch"><input type="checkbox" id="fsKeepAlive"><i></i><span class="mut">only keep alive</span></label></div>' +
+    '<div class="hint">Mirage pulls raw host:port[:user:pass] lists from community sources, parses them, then verifies each proxy live (exit IP + geo + latency).</div>' +
+    '<div class="issue warn">Free public proxies are shared and unreliable — treat them as disposable, never for accounts you care about.</div>' +
+    '<div class="srcgrid">' + rows.join('') + '</div>' +
+    '<div class="row2">' +
+      '<div><label>Keep types</label><div style="display:flex;gap:14px;flex-wrap:wrap;padding-top:6px">' +
+        TYPES.map(t => '<label class="ck" style="display:inline-flex;align-items:center;gap:6px"><input type="checkbox" class="typ" value="' + t + '" checked style="width:auto"> ' + t + '</label>').join('') +
+      '</div></div>' +
+      '<div class="row2">' +
+        '<div><label>Max to import</label><input id="fsLimit" type="number" value="60" min="1" max="1000"></div>' +
+        '<div><label>Probe concurrency</label><input id="fsConc" type="number" value="10" min="1" max="25"></div>' +
       '</div>' +
     '</div>' +
-    '<div id="fsResult" style="margin-top:6px"></div>' +
+    '<div><label>Also try a custom list URL</label><input id="fsUrl" placeholder="https://example.com/proxies.txt"></div>' +
+    '<div style="display:flex;gap:18px;flex-wrap:wrap">' +
+      '<label class="switch"><input type="checkbox" id="fsCheck" checked><i></i><span class="mut">auto-check</span></label>' +
+      '<label class="switch"><input type="checkbox" id="fsKeepAlive"><i></i><span class="mut">only keep alive</span></label>' +
+    '</div>' +
+    '<div id="fsResult"></div>' +
     '</div>';
   const actions = [
+    { label: 'Close', kind: 'ghost', onClick: () => close() },
     { label: 'Fetch & check', kind: 'primary', onClick: async ({ bodyEl }) => {
       const picked = [...bodyEl.querySelectorAll('.src:checked')].map(x => x.value);
       const types = [...bodyEl.querySelectorAll('.typ:checked')].map(x => x.value);
@@ -455,19 +535,18 @@ async function fetchFromSources(onDone) {
         check: bodyEl.querySelector('#fsCheck').checked,
         onlyKeepAlive: bodyEl.querySelector('#fsKeepAlive').checked } });
       await refreshAll(); onDone?.();
-      const per = (r.perSource || []).map(s => App.esc(s.source) + ': ' + s.added + ' added' + (s.error ? ' (' + App.esc(s.error) + ')' : '')).join('<br>');
+      const per = (r.perSource || []).map(s => '<div class="r"><span class="k">' + App.esc(s.source) + '</span><span>' + s.added + ' added' + (s.error ? ' · ' + App.esc(s.error) : '') + '</span></div>').join('');
       const errs = (r.errors || []).map(App.esc).join('<br>');
       box.innerHTML = '<div class="kv">' +
         '<div class="r"><span class="k">Parsed from sources</span><b>' + r.fetched + '</b></div>' +
         '<div class="r"><span class="k">Imported (new)</span><b>' + r.created + '</b></div>' +
-        (r.check && r.check.ran ? '<div class="r"><span class="k">Checked · alive / dead</span><b class="ok-c">' + r.check.alive + '</b> / <b class="bad-c">' + r.check.dead + '</b></div>' : '') +
+        (r.check && r.check.ran ? '<div class="r"><span class="k">Checked · alive / dead</span><b class="ok-c">' + r.check.alive + '</b><b> / </b><b class="bad-c">' + r.check.dead + '</b></div>' : '') +
         per + '</div>' + (errs ? '<div class="issue critical" style="margin-top:8px">Source errors:<br>' + errs + '</div>' : '');
-      toast('Imported ' + r.created + (r.check && r.check.ran ? ', ' + r.check.alive + ' alive' : ''), 'ok');
+      toast('Imported ' + r.created + (r.check && r.check.ran ? ' · alive ' + r.check.alive : ''), 'ok');
       return true;
     } },
-    { label: 'Close', kind: 'ghost', onClick: () => close() },
   ];
-  const { close, bodyEl } = modal({ title: 'Import from public sources', wide: true, body, actions });
+  const { close } = modal({ title: 'Import from public sources', wide: true, body, actions });
 }
 
 /* ===================== TEAM ===================== */
@@ -620,6 +699,17 @@ ROUTES.settings = (view) => {
       </div>
     </div>
     <div style="display:grid;gap:14px">
+      <div class="card"><h3>Interface</h3>
+        <div class="form">
+          <div><label>Language</label>
+            <select id="sLang">
+              <option value="en" ${App.state.lang === 'en' ? 'selected' : ''}>English</option>
+              <option value="ru" ${App.state.lang === 'ru' ? 'selected' : ''}>Русский</option>
+            </select>
+          </div>
+          <div class="hint">The whole interface (buttons, labels, hints) follows this language. Technical terms (SOCKS5, JA3, CDP…) stay as-is.</div>
+        </div>
+      </div>
       <div class="card"><h3>Backup & data</h3>
         <div class="form">
           <button class="btn" id="sExport">⤓ Export all (profiles + groups + proxies)</button>
@@ -648,6 +738,7 @@ ROUTES.settings = (view) => {
     } });
     await refreshAll(); toast('Settings saved', 'ok');
   });
+  document.getElementById('sLang').onchange = e => guard(async () => { await setLang(e.target.value); toast('Settings saved', 'ok'); });
   document.getElementById('sExport').onclick = () => location.href = '/api/backup/export';
   document.getElementById('sImport').onclick = () => document.getElementById('sFile').click();
   document.getElementById('sFile').onchange = e => guard(async () => {
