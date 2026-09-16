@@ -12,7 +12,7 @@ import { listSources, fetchProxies } from './proxy/sources.js';
 import { bulkProbe } from './proxy/checker.js';
 import { parseClientHello } from './net/clienthello.js';
 import { sealDNA, openDNA, dnaThumb } from './fingerprint/dna.js';
-import { uid, now, jparse, signToken, verifyToken, sha256, fmtBytes, sleep } from './util.js';
+import { uid, now, jparse, signToken, verifyToken, sha256, hashPin, verifyPin, fmtBytes, sleep } from './util.js';
 
 export function createApi(ctx) {
   const { db, bm, hub, getSettings, setSettings, rotator } = ctx;
@@ -28,12 +28,8 @@ export function createApi(ctx) {
   function sessionFor(req) {
     const c = req.headers.cookie || '';
     const m = c.match(/mirage_sid=([^;]+)/); if (!m) return null;
-    const p = m[1].split('.');
-    if (p.length !== 2) return null;
-    const expect = sha256(SECRET + m[1].split('.')[0]); if (expect !== m[1].split('.')[1]) return null;
-    const id = Buffer.from(m[1].split('.')[0], 'base64url').toString();
-    const mem = db.getMemberRaw ? null : null;
-    return id;
+    const payload = verifyToken(SECRET, m[1]);   // HMAC-SHA256 + exp (replaces forgeable sha256(SECRET‖id))
+    return payload && typeof payload.id === 'string' ? payload.id : null;
   }
   function memberFor(req) {
     const id = sessionFor(req); if (!id) return null;
@@ -47,6 +43,8 @@ export function createApi(ctx) {
   const canWrite = (req, res) => { const m = memberFor(req); if (!m) { err(res, 401, 'auth required'); return false; } if (m.role === 'viewer') { err(res, 403, 'viewer cannot modify'); return false; } return true; };
   const need = (req, res, roles) => { const m = memberFor(req); if (!m) { err(res, 401, 'auth required'); return false; } if (roles && !roles.includes(m.role)) { err(res, 403, 'insufficient role'); return false; } return true; };
   const authInfo = (req) => { const m = memberFor(req); return m ? { member: m.id, role: m.role } : (apiKeyFor(req) ? { role: 'automation' } : null); };
+  // authOk: any authenticated principal (session member OR API key) — used by the global /api gate.
+  const authOk = (req) => !!(memberFor(req) || apiKeyFor(req));
 
   // ---- Team audit trail: who did what, on which profile, via which exit IP ----
   function auditLog(type, req, opts = {}) {
@@ -77,7 +75,7 @@ export function createApi(ctx) {
   };
 
   // ---------------- profiles ----------------
-  H['GET /api/profiles'] = (req, res) => ok(res, { profiles: db.listProfiles().map(publicProfile) });
+  H['GET /api/profiles'] = (req, res) => ok(res, { profiles: db.listProfilesLite().map(publicProfileLite) });
   H['GET /api/profiles/:id'] = (req, res, p) => { const pr = db.getProfile(p.id); if (!pr) return err(res, 404, 'not found');
     const full = publicProfile(pr); full.fingerprint = pr.fingerprint; full.inline_proxy = pr.inline_proxy || ''; full.owner = pr.owner; full.created_at = pr.created_at;
     ok(res, { profile: full }); };
@@ -132,6 +130,7 @@ export function createApi(ctx) {
 
   // ---- Device-DNA: encrypted, portable identity export / import ----
   H['POST /api/profiles/:id/export'] = (req, res, p, body) => {
+    if (!canWrite(req, res)) return;
     const pr = db.getProfile(p.id); if (!pr) return err(res, 404, 'profile not found');
     const fp = pr.fingerprint || {};
     const dna = {
@@ -269,8 +268,8 @@ export function createApi(ctx) {
   };
   H['DELETE /api/proxies'] = (req, res) => { if (!canWrite(req, res)) return; const n = db.countProxiesInUse(); db.clearProxies(); ok(res, { ok: true, inUse: n }); };
 
-  H['POST /api/proxies/test'] = async (req, res, _p, body) => { const r = await probeProxy({ scheme: (body.scheme || 'http').toLowerCase(), host: body.host, port: body.port, user: body.user, pass: body.pass }); json(res, r.ok ? 200 : 200, r); };
-  H['POST /api/proxies/:id/probe'] = async (req, res, p) => { const px = db.getProxy(p.id); if (!px) return err(res, 404, 'not found'); const r = await probeProxy(px); if (r.ok) db.saveProxy({ ...px, last_check: JSON.stringify(r) }); ok(res, r); };
+  H['POST /api/proxies/test'] = async (req, res, _p, body) => { if (!canWrite(req, res)) return; const r = await probeProxy({ scheme: (body.scheme || 'http').toLowerCase(), host: body.host, port: body.port, user: body.user, pass: body.pass }); json(res, r.ok ? 200 : 200, r); };
+  H['POST /api/proxies/:id/probe'] = async (req, res, p) => { if (!canWrite(req, res)) return; const px = db.getProxy(p.id); if (!px) return err(res, 404, 'not found'); const r = await probeProxy(px); if (r.ok) db.saveProxy({ ...px, last_check: JSON.stringify(r) }); ok(res, r); };
   // dedupe helpers for proxy import/fetch
   const existingProxyKeys = () => { const s = new Set(); for (const p of db.listProxies()) s.add(proxyKey(p)); return s; };
   function saveProxiesDedup(parsed, { labelPrefix = '', country = '', rotator = 0, note = '', seen = null } = {}) {
@@ -327,7 +326,7 @@ export function createApi(ctx) {
   };
 
   // ---------------- browser sessions ----------------
-  const canOperate = (req, res) => { const m = memberFor(req); if (m && m.role !== 'viewer') return true; if (m && m.role === 'viewer') return true; if (apiKeyFor(req)) return true; err(res, 401, 'auth required'); return false; };
+  const canOperate = (req, res) => { const m = memberFor(req); if (m && m.role !== 'viewer') return true; if (apiKeyFor(req)) return true; if (m && m.role === 'viewer') { err(res, 403, 'viewer cannot operate kernels'); return false; } err(res, 401, 'auth required'); return false; };
   H['POST /api/browser/start'] = async (req, res, _p, body) => {
     if (!canOperate(req, res)) return;
     try { const info = await bm.launch(body.profileId, { url: body.url, cloud: body.cloud, fresh: body.fresh }); bumpProfile(body.profileId); auditLog('audit.launch', req, { profileId: body.profileId }); ok(res, info); }
@@ -405,8 +404,8 @@ export function createApi(ctx) {
 
   // ---------------- members ----------------
   H['GET /api/members'] = (req, res) => { if (!need(req, res, ['admin'])) return; ok(res, { members: db.listMembers() }); };
-  H['POST /api/members'] = (req, res, _p, body) => { if (!need(req, res, ['admin'])) return; const id = db.saveMember({ id: body.id, name: body.name, email: body.email, role: body.role || 'member', pin_hash: body.pin ? sha256(String(body.pin)) : '', color: body.color }); ok(res, { id }); };
-  H['PUT /api/members/:id'] = (req, res, p, body) => { if (!need(req, res, ['admin'])) return; const cur = db.getMemberRaw(p.id); if (!cur) return err(res, 404, 'not found'); const m = { ...cur, ...body, id: cur.id, pin_hash: body.pin ? sha256(String(body.pin)) : cur.pin_hash }; db.saveMember(m); ok(res, { ok: true }); };
+  H['POST /api/members'] = (req, res, _p, body) => { if (!need(req, res, ['admin'])) return; const id = db.saveMember({ id: body.id, name: body.name, email: body.email, role: body.role || 'member', pin_hash: body.pin ? hashPin(String(body.pin)) : '', color: body.color }); ok(res, { id }); };
+  H['PUT /api/members/:id'] = (req, res, p, body) => { if (!need(req, res, ['admin'])) return; const cur = db.getMemberRaw(p.id); if (!cur) return err(res, 404, 'not found'); const m = { ...cur, ...body, id: cur.id, pin_hash: body.pin ? hashPin(String(body.pin)) : cur.pin_hash }; db.saveMember(m); ok(res, { ok: true }); };
   H['DELETE /api/members/:id'] = (req, res, p) => { if (!need(req, res, ['admin'])) return; db.deleteMember(p.id); ok(res, { ok: true }); };
 
   // ---------------- api keys ----------------
@@ -415,13 +414,32 @@ export function createApi(ctx) {
   H['DELETE /api/apikeys/:key'] = (req, res, p) => { if (!need(req, res, ['admin'])) return; db.revokeApiKey(p.key); ok(res, { ok: true }); };
 
   // ---------------- auth ----------------
+  // Per-IP login throttle: the login route is the only public endpoint, so it is the brute-force
+  // target for the PIN. In-memory is fine for the single-process control plane. Window 15 min / 10 tries.
+  const LOGIN_MAX = 10, LOGIN_WINDOW = 15 * 60 * 1000;
+  const loginAttempts = new Map();   // ip -> { n, reset }
+  function loginThrottle(req) {
+    const ip = (req.socket && req.socket.remoteAddress) || 'unknown';
+    const nowMs = Date.now();
+    let rec = loginAttempts.get(ip);
+    if (!rec || nowMs > rec.reset) { rec = { n: 0, reset: nowMs + LOGIN_WINDOW }; loginAttempts.set(ip, rec); }
+    return { ip, rec, blocked: rec.n >= LOGIN_MAX, wait: Math.max(0, rec.reset - nowMs) };
+  }
   H['POST /api/auth/login'] = (req, res, _p, body) => {
-    const m = db.getMemberByPinHash(sha256(String(body.pin)));
-    if (!m) return err(res, 401, 'invalid pin');
-    const tok = Buffer.from(m.id).toString('base64url') + '.' + sha256(SECRET + Buffer.from(m.id).toString('base64url'));
+    const t = loginThrottle(req);
+    if (t.blocked) { res.setHeader('Retry-After', Math.ceil(t.wait / 1000)); return err(res, 429, 'too many attempts, try later'); }
+    const pin = String((body && body.pin) || '');
+    if (!pin) return err(res, 401, 'invalid pin');
+    let matched = null, legacy = false;
+    for (const mem of db.listMembersForAuth()) { const v = verifyPin(pin, mem.pin_hash); if (v) { matched = mem; legacy = (v === 'legacy'); break; } }
+    t.rec.n++;   // count every attempt incl. failures; success clears below
+    if (!matched) return err(res, 401, 'invalid pin');
+    loginAttempts.delete(t.ip);
+    if (legacy) db.setMemberPinHash(matched.id, hashPin(pin));   // transparent scrypt upgrade
+    const tok = signToken(SECRET, { id: matched.id, exp: Date.now() + 10 * 24 * 3600 * 1000 });
     res.setHeader('Set-Cookie', `mirage_sid=${tok}; HttpOnly; Path=/; SameSite=Lax; Max-Age=864000`);
-    db.logEvent('audit.login', { profileId: '', member: 'member:' + m.id, meta: { actor: 'member:' + m.id, role: m.role, ip: req.socket.remoteAddress } });
-    ok(res, { member: { id: m.id, name: m.name, role: m.role, color: m.color } });
+    db.logEvent('audit.login', { profileId: '', member: 'member:' + matched.id, meta: { actor: 'member:' + matched.id, role: matched.role, ip: t.ip } });
+    ok(res, { member: { id: matched.id, name: matched.name, role: matched.role, color: matched.color } });
   };
   H['POST /api/auth/logout'] = (req, res) => { res.setHeader('Set-Cookie', 'mirage_sid=; HttpOnly; Path=/; Max-Age=0'); ok(res, { ok: true }); };
   H['GET /api/auth/me'] = (req, res) => { const m = memberFor(req); ok(res, { member: m ? { id: m.id, name: m.name, role: m.role, color: m.color } : null }); };
@@ -546,6 +564,13 @@ export function createApi(ctx) {
   async function invokeRpc(conn, msg) {
     const [domain, action] = String(msg.method || '').split('.');
     const a = msg.args || {};
+    // WS upgrade is already auth-gated (session/API key) in ws.js; here enforce role. Viewer may do
+    // read-only live inspection but cannot drive kernels or exfiltrate cookies/snapshots.
+    const m = conn.req ? memberFor(conn.req) : null;
+    const isKey = !!conn.req && !!apiKeyFor(conn.req);
+    const OPERATE = new Set(['browser.tab', 'browser.navigate', 'browser.human', 'browser.stop', 'browser.cookies', 'browser.snapshot']);
+    const sig = domain + '.' + action;
+    if (OPERATE.has(sig) && !(isKey || (m && m.role !== 'viewer'))) throw new Error('viewer cannot perform: ' + sig);
     if (domain === 'browser') {
       if (action === 'tabs') return bm.tabs(a.profileId);
       if (action === 'tab') {
@@ -583,8 +608,16 @@ export function createApi(ctx) {
       os: fp.osName, browser: fp.browserLabel, ua: fp.ua, tz: fp.timezone?.id, country: fp.meta?.region, screen: fp.screen ? `${fp.screen.width}x${fp.screen.height}` : '', gpu: fp.gpu?.unmaskedVendor,
       canvas: fp.canvas?.mode, audio: fp.audio?.mode, webrtc: fp.webrtc?.mode, score: audit.score, issues: audit.critCount, last_open: p.last_open, open_count: p.open_count, updated_at: p.updated_at, settings: p.settings };
   }
+  // List variant: reads the precomputed scalar columns (no fingerprint parse / no per-row audit).
+  // Mirrors the fields publicProfile exposes for the list view; omits heavy/unused keys (ua, gpu,
+  // audio, webrtc, settings) that only the editor consumes — and those come from GET /:id (full).
+  function publicProfileLite(p) {
+    return { id: p.id, name: p.name, group_id: p.group_id, color: p.color, favorite: !!p.favorite, tags: p.tags, memo: p.memo, proxy_id: p.proxy_id, inline_proxy: p.inline_proxy ? maskProxy(p.inline_proxy) : '',
+      os: p.os, browser: p.browser, country: p.country, tz: p.tz, screen: p.screen, canvas: p.canvas, score: p.score, issues: p.issues,
+      last_open: p.last_open, open_count: p.open_count, updated_at: p.updated_at };
+  }
   function maskProxy(s) { try { return s.replace(/\/\/[^@]+@/, '//***:***@'); } catch { return s; } }
   function authCtx(req) { return { member: memberFor(req), key: apiKeyFor(req) }; }
 
-  return { H, json, ok, err, memberFor, apiKeyFor, authCtx, canWrite, need, publicProfile, invokeRpc, bumpProfile };
+  return { H, json, ok, err, memberFor, apiKeyFor, authCtx, authOk, canWrite, need, publicProfile, invokeRpc, bumpProfile };
 }

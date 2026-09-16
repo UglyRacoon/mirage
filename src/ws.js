@@ -62,13 +62,18 @@ export class WSConn extends EventEmitter {
   }
 }
 
-export function attachWebSocket(server, pathPrefix, onConnection) {
+export function attachWebSocket(server, pathPrefix, onConnection, authorize) {
   server.on('upgrade', (req, socket, head) => {
     try {
       const url = new URL(req.url, 'http://x');
       if (!url.pathname.startsWith(pathPrefix)) return; // let others handle
       const key = req.headers['sec-websocket-key'];
       if (!key || (req.headers.upgrade || '').toLowerCase() !== 'websocket') return;
+      // Reject unauthenticated / cross-origin upgrades BEFORE the 101 handshake (must-fix #2).
+      // Same-origin check blocks Cross-Site WebSocket Hijacking; authorize() enforces session/API key.
+      const origin = req.headers.origin;
+      if (origin) { try { if (new URL(origin).host !== (req.headers.host || '')) throw 0; } catch { try { socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n'); socket.destroy(); } catch (e0) { } return; } }
+      if (authorize && !authorize(req)) { try { socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n'); socket.destroy(); } catch (e0) { } return; }
       const accept = crypto.createHash('sha1').update(key + GUID).digest('base64');
       const headers = ['HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade', `Sec-WebSocket-Accept: ${accept}`, '', ''].join('\r\n');
       socket.write(headers);

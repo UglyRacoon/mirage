@@ -3,6 +3,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import * as db from './db.js';
 import { createApi } from './api.js';
@@ -16,6 +17,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const PUBLIC = path.join(ROOT, 'public');
 const DATA = process.env.MIRAGE_DATA || path.join(ROOT, 'data');
+
+// Routes reachable WITHOUT a session/API key (pre-login bootstrap only).
+const PUBLIC_API = new Set(['POST /api/auth/login', 'GET /api/auth/me']);
+
+// Security response headers (must-fix M2). CSP keeps 'unsafe-inline' for script/style so the SPA's
+// inline handlers keep working, but blocks external script/object/base, framing by others, and caps
+// connect/img to self+data (screenshots are data: URLs) + ws. Tighten further once inline handlers go.
+const CSP = "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' ws: wss:; frame-src 'self'; frame-ancestors 'self'; base-uri 'self'; object-src 'none'; form-action 'self'";
+const CORS_ALLOW = (process.env.MIRAGE_CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+// Only reflect an Origin that is same-host or explicitly allow-listed — never wildcard (M3/CWE-942).
+function safeCorsOrigin(req) {
+  const o = req.headers.origin; if (!o) return null;
+  try { const u = new URL(o); if (u.host === (req.headers.host || '')) return o; if (CORS_ALLOW.includes(o)) return o; } catch (e) { }
+  return null;
+}
 
 const DEFAULT_SETTINGS = {
   maxSessions: 3, chromiumPath: '', forceXvfb: false, shotQuality: 55, liveFps: 6,
@@ -40,9 +56,20 @@ async function main() {
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://localhost');
-      const pathname = decodeURIComponent(url.pathname);
+      let pathname; try { pathname = decodeURIComponent(url.pathname); } catch { res.writeHead(400, { 'Content-Type': 'text/plain' }); return res.end('bad path'); }
+      // Apply security headers to every response (API + static). setHeader values merge with any
+      // writeHead header objects used downstream, so this single injection point is enough.
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      res.setHeader('Content-Security-Policy', CSP);
+      const _cors = safeCorsOrigin(req);
+      if (_cors) { res.setHeader('Access-Control-Allow-Origin', _cors); res.setHeader('Access-Control-Allow-Credentials', 'true'); res.setHeader('Vary', 'Origin'); }
       if (pathname.startsWith('/api/')) {
-        if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type,X-Api-Key', 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS' }); return res.end(); }
+        if (req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Headers': 'Content-Type,X-Api-Key', 'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS', 'Access-Control-Max-Age': '600' }); return res.end(); }
+        // Global auth gate (must-fix #2): every /api/* endpoint requires a session member OR an API
+        // key, except the public bootstrap routes. Handlers still do finer RBAC (canWrite/need/canOperate).
+        if (!api.authOk(req) && !PUBLIC_API.has(req.method + ' ' + pathname)) return api.err(res, 401, 'auth required');
         let body = {};
         if (req.method === 'POST' || req.method === 'PUT') { const raw = await readBody(req); if (raw) { try { body = JSON.parse(raw); } catch { return api.err(res, 400, 'invalid JSON body'); } } }
         const route = matchRoute(api.H, req.method, pathname);
@@ -54,13 +81,16 @@ async function main() {
       api.err(res, 405, 'method not allowed');
     } catch (e) {
       err('http', e.message);
-      if (!res.headersSent) api.err(res, 500, 'internal error: ' + e.message);
+      if (!res.headersSent) api.err(res, 500, 'internal error');   // never leak internals to the client (M5)
     }
   });
 
   // ---------------- WebSocket ----------------
   attachWebSocket(server, '/ws', (conn) => {
     conn._channels = new Set();
+    const member = api.memberFor(conn.req);            // session member (upgrade carried the cookie)
+    const byKey = !!api.apiKeyFor(conn.req);           // API-key client (e.g. ?key= in ws url)
+    const canOperateWs = (byKey || (member && member.role !== 'viewer'));
     conn.on('message', (buf) => {
       let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
       if (msg.type === 'ping') return conn.sendJSON({ type: 'pong', t: Date.now() });
@@ -71,6 +101,7 @@ async function main() {
       }
       if (msg.type === 'unsubscribe' && msg.channel) { hub.leave(msg.channel, conn); conn._channels.delete(msg.channel); return; }
       if (msg.type === 'input' && msg.channel?.startsWith?.('live:')) {
+        if (!canOperateWs) return conn.sendJSON({ type: 'error', error: 'viewer cannot control kernels' });
         const pid = msg.channel.slice(5); const ev = msg.ev || {};
         try {
           if (ev.kind === 'mouse') bm.inputMouse(pid, ev).catch(() => { });
@@ -89,12 +120,13 @@ async function main() {
       }
     });
     conn.on('close', () => { for (const c of conn._channels) hub.leave(c, conn); });
-  });
+  }, (req) => api.authOk(req));
   function startLive(pid) { try { if (bm.isRunning(pid)) bm.startLive(pid, { fps: loadSettings().liveFps || 6 }); } catch (e) { } }
   hub.onLeave((channel) => { if (channel.startsWith('live:') && hub.count(channel) === 0) bm.stopLive(channel.slice(5)); });
 
   const PORT = +(process.env.PORT || 7788);
-  server.listen(PORT, '0.0.0.0', () => {
+  const HOST = process.env.HOST || '0.0.0.0';
+  server.listen(PORT, HOST, () => {
     ok('mirage', 'control plane on  http://localhost:' + PORT);
     ok('mirage', 'automation API     http://localhost:' + PORT + '/api/v1 (X-Api-Key)');
     const bin = bm.findBinary();
@@ -122,6 +154,31 @@ function matchRoute(H, method, pathname) {
   return null;
 }
 
+const TEXT_EXT = new Set(['.html', '.js', '.css', '.json', '.svg']);
+const _staticCache = new Map();   // full path -> { etag, buf, gz }
+function sendStatic(req, res, full, st, forceHtml) {
+  const ext = path.extname(full);
+  const ct = forceHtml ? 'text/html; charset=utf-8'
+    : ({ '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2' }[ext] || 'application/octet-stream');
+  // Weak ETag from size+mtime → cheap revalidation (304) without serving stale after a redeploy.
+  const etag = 'W/"' + st.size.toString(36) + '-' + Math.floor(st.mtimeMs).toString(36) + '"';
+  res.setHeader('Vary', 'Accept-Encoding');
+  if (req.headers['if-none-match'] === etag) { res.writeHead(304); return res.end(); }
+  const headers = { 'Content-Type': ct, 'Cache-Control': 'public, max-age=0, must-revalidate', ETag: etag };
+  if (req.method === 'HEAD') { headers['Content-Length'] = st.size; res.writeHead(200, headers); return res.end(); }
+  let entry = _staticCache.get(full);
+  if (!entry || entry.etag !== etag) {
+    const buf = fs.readFileSync(full);
+    entry = { etag, buf, gz: TEXT_EXT.has(ext) ? zlib.gzipSync(buf, { level: 6 }) : null };
+    _staticCache.set(full, entry);
+  }
+  if (entry.gz && /\bgzip\b/.test(req.headers['accept-encoding'] || '')) {
+    headers['Content-Encoding'] = 'gzip'; headers['Content-Length'] = entry.gz.length;
+    res.writeHead(200, headers); return res.end(entry.gz);
+  }
+  headers['Content-Length'] = entry.buf.length;
+  res.writeHead(200, headers); return res.end(entry.buf);
+}
 function serveStatic(req, res, pathname) {
   let rel = pathname === '/' ? '/index.html' : pathname;
   if (rel === '/checker') rel = '/checker.html';
@@ -129,15 +186,12 @@ function serveStatic(req, res, pathname) {
   const full = path.join(PUBLIC, safe);
   if (!full.startsWith(PUBLIC)) { res.writeHead(403); return res.end('forbidden'); }
   fs.stat(full, (e, st) => {
-    if (!e && st.isFile()) {
-      const ext = path.extname(full);
-      const ct = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.woff2': 'font/woff2' }[ext] || 'application/octet-stream';
-      res.writeHead(200, { 'Content-Type': ct, 'Cache-Control': 'no-cache' });
-      return fs.createReadStream(full).pipe(res);
-    }
+    if (!e && st.isFile()) return sendStatic(req, res, full, st, false);
     if (/^\/(profiles|proxies|settings|members|automation|dashboard|logs|flows|checker-view)/.test(pathname) || !path.extname(pathname)) {
-      return fs.readFile(path.join(PUBLIC, 'index.html'), (e2, b) => {
-        if (e2) { res.writeHead(404); res.end('not found'); } else { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(b); }
+      const idx = path.join(PUBLIC, 'index.html');
+      return fs.stat(idx, (e2, st2) => {
+        if (e2) { res.writeHead(404); return res.end('not found'); }
+        sendStatic(req, res, idx, st2, true);   // SPA fallback served as HTML with the same caching/gzip
       });
     }
     res.writeHead(404); res.end('not found');

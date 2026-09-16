@@ -81,8 +81,31 @@ export function verifyToken(secret, token) {
   if (!token || !token.includes('.')) return null;
   const [body, sig] = token.split('.');
   const expect = crypto.createHmac('sha256', secret).update(body).digest('base64url');
-  if (sig !== expect) return null;
+  const a = Buffer.from(sig), b = Buffer.from(expect);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
   try { const p = JSON.parse(Buffer.from(body, 'base64url').toString()); if (p.exp && p.exp < Date.now()) return null; return p; } catch { return null; }
+}
+// PIN hashing: scrypt with per-user random salt (replaces unsalted sha256 of a short PIN).
+// verifyPin also accepts the LEGACY unsalted sha256 hex so existing members keep working and
+// are transparently upgraded on next successful login (returns 'legacy' to signal the caller).
+const SCRYPT = { N: 16384, r: 8, p: 1 };
+export function hashPin(pin) {
+  const salt = crypto.randomBytes(16);
+  const key = crypto.scryptSync(String(pin), salt, 32, SCRYPT);
+  return `scrypt$${SCRYPT.N}$${SCRYPT.r}$${SCRYPT.p}$${salt.toString('base64url')}$${key.toString('base64url')}`;
+}
+export function verifyPin(pin, stored) {
+  if (typeof stored !== 'string' || !stored) return false;
+  if (stored.startsWith('scrypt$')) {
+    const parts = stored.split('$'); if (parts.length !== 6) return false;
+    const salt = Buffer.from(parts[4], 'base64url'); const exp = Buffer.from(parts[5], 'base64url');
+    const key = crypto.scryptSync(String(pin), salt, 32, { N: +parts[1], r: +parts[2], p: +parts[3] });
+    return key.length === exp.length && crypto.timingSafeEqual(key, exp);
+  }
+  // legacy unsalted sha256 hex — constant-time compare; caller upgrades on match
+  const lg = sha256(String(pin));
+  const a = Buffer.from(lg), b = Buffer.from(stored);
+  return a.length === b.length && crypto.timingSafeEqual(a, b) ? 'legacy' : false;
 }
 export function basicAuthOk(header, user, passHash) {
   if (!header) return false;

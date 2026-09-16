@@ -10,3 +10,6 @@ npm-debug.log*
 # local overrides
 .env
 *.local
+
+# Local security-audit report (public repo — kept out of VCS)
+AUDIT.md

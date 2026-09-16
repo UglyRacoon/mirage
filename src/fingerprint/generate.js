@@ -141,13 +141,16 @@ function buildMedia(rng, family, isMobile, archetype) {
 export function generateFingerprint(opts = {}) {
   const seed = opts.seed || uid(12);
   const rng = rngFor(seed + (opts.variant || ''));
-  const osId = opts.os || pickWeighted(rng, OS_WEIGHTS);
+  let osId = opts.os || pickWeighted(rng, OS_WEIGHTS);
+  if (!OSES[osId]) osId = pickWeighted(rng, OS_WEIGHTS);            // unknown OS → random valid one (don't crash on arbitrary client input)
   const os = OSES[osId];
   const family = os.family;
   let browser = opts.browser || browserForOs(rng, osId);
+  if (!['chrome', 'edge', 'firefox', 'safari'].includes(browser)) browser = browserForOs(rng, osId);  // unknown browser → OS-appropriate
   if (family === 'android' && browser === 'safari') browser = 'chrome';   // Safari does not run on Android
   if (family === 'ios' && browser === 'edge') browser = 'safari';          // keep iOS webkit variants coherent
-  const country = opts.country || pickWeighted(rng, COUNTRY_WEIGHTS);
+  let country = opts.country || pickWeighted(rng, COUNTRY_WEIGHTS);
+  if (!REGIONS[country]) country = pickWeighted(rng, COUNTRY_WEIGHTS);     // unknown country → random valid region
   const region = REGIONS[country];
 
   const chromeMajor = rng.pick(CHROME_MAJORS);

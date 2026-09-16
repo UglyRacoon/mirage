@@ -13,7 +13,7 @@ test/selftest.js 31 engine tests
 data/           SQLite db + per-profile kernel dirs (created at runtime)
 ```
 
-**Run:** `npm start` → http://localhost:7788 → sign in with PIN `mirage` (change it in Team).
+**Run:** `npm start` → http://localhost:7788 → sign in with the **one-time PIN printed to the server log on first run** (change it in Team). A legacy install keeps its old PIN but auto-upgrades it to a salted scrypt hash on first login.
 **Tests:** `npm run selftest`.
 
 ---
@@ -34,7 +34,7 @@ test/selftest.js 31 тест движка
 data/            SQLite БД + каталоги ядер по профилям (создаются при запуске)
 ```
 
-**Запуск:** `npm start` → http://localhost:7788 → вход по PIN `mirage` (смените в Team).
+**Запуск:** `npm start` → http://localhost:7788 → вход по **одноразовому PIN, выведенному в лог сервера при первом запуске** (смените в Team). У существующей установки старый PIN работает и при первом входе автоматически апгрейдится до солёного scrypt-хэша.
 **Тесты:** `npm run selftest`.
 
 ### Что внутри
@@ -314,11 +314,61 @@ of the script to taste. For the SPA+API build, the script copies the working tre
 `REPO` at a git checkout). After deploy, **change the default PIN in Team** and (if remote)
 front it with TLS + auth.
 
-> **Do this now:** the default PIN is `mirage` and it is plain HTTP on your LAN. Change the PIN in
-> **Team**, and if this host is not fully trusted, put the vhost behind your reverse-proxy auth or a
-> Tailscale ACL before leaving it exposed. The automation API keys live in **Settings → API keys**.
+> **Do this now:** fresh installs no longer ship a default PIN — a random one is printed to the log
+> once on first run; an *existing* install that still uses the historical PIN `mirage` keeps working
+> (it auto-upgrades to a salted hash) but **you should change it in Team** since `mirage` is publicly
+> known. The whole `/api/*` surface is now auth-gated, but the transport is still plain HTTP — if this
+> host is reachable beyond your LAN, **front the vhost with TLS** (`nginx listen 443`) or a Tailscale
+> ACL before leaving it exposed. The automation API keys live in **Settings → API keys**.
 
-## 7 · Roadmap (what the market has that we don't)
+## 7 · Security & performance hardening (applied)
+
+A full audit (see `AUDIT.md`) drove a set of fixes; they are enforced and verified by the pre-prod
+gate `test/prodcheck.mjs` (**26 PASS · 1 FAIL** — the only remaining FAIL is *TLS*, an infra step,
+not code) and keep `test/selftest.js` at **31 passed / 0 failed**.
+
+**AuthN / AuthZ**
+- **Global auth gate** on every `/api/*` route — a valid session cookie **or** an `X-Api-Key` is
+  required; only `POST /api/auth/login` and `GET /api/auth/me` are public. This closed the previous
+  hole where profiles, proxies, backups and kernel control were readable/operable unauthenticated.
+- **WebSocket is authenticated** at the upgrade (rejected before `101` without a session/key) plus a
+  **same-origin `Origin` check** → no cross-site WS-hijack into a running kernel.
+- **RBAC**: `viewer` is strictly read-only across REST *and* the browser RPC (`input`, `browser.*`);
+  proxy test/probe and profile export now require `canWrite`.
+- **Login rate-limit**: 10 attempts / 15 min / IP → `429` + `Retry-After`.
+
+**Credentials & sessions**
+- PINs are stored as **salted scrypt** (`N=16384, r=8, p=1`); a legacy unsalted `sha256` hash is
+  accepted **once** and transparently upgraded on first successful login (no lockout of old installs).
+- Sessions are **HMAC-SHA256 signed tokens with expiry** and timing-safe verification (replacing a
+  forgeable `sha256(secret‖id)` check). Fresh installs seed a **random one-time admin PIN** to the
+  log instead of the publicly-known `mirage`.
+
+**Input & transport**
+- **Stored-XSS closed at the root**: every entity id is validated (`^[A-Za-z0-9_-]{1,64}$`) on save,
+  so a client-supplied id like `<svg onload=…>` or a `javascript:` href can never be persisted.
+- Security headers on all responses: **CSP** (`frame-ancestors 'self'`, `base-uri 'self'`,
+  `object-src 'none'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`,
+  `Referrer-Policy: no-referrer`. CORS no longer reflects `*` (same-host / allow-list only); 5xx
+  responses no longer leak internal error strings. `generateFingerprint` falls back on unknown
+  `os`/`browser`/`country` instead of crashing. `HOST` is configurable (set `127.0.0.1` behind a proxy).
+
+**Performance** (measured with `test/bench.mjs`)
+- **Static assets**: `gzip` (−66…73% bytes: `views.js` 67→18 KB) + weak `ETag` / `must-revalidate`
+  → repeat SPA loads return **304** (≈0 bytes).
+- **SQLite**: `synchronous=NORMAL` + `busy_timeout` + a prepared-statement cache → writes **×3.0**,
+  single-row reads **×2.4**.
+- **Profile list denormalized for reads**: `score`/`issues`/`os`/`browser`/`country`/`tz`/`screen`/
+  `canvas` are precomputed at save time (including `auditFingerprint`), so `GET /api/profiles` no
+  longer parses fingerprint blobs or re-runs the audit per row → **×18.7 (−95% CPU)** on 200 profiles.
+  The list payload is unchanged and `GET /api/profiles/:id` still returns the full fingerprint;
+  pre-existing rows are backfilled automatically on startup.
+
+**Still operator-owned (not code):** front the vhost with **TLS**, **rotate the admin PIN** if it is
+still the historical default, and add systemd sandboxing (`NoNewPrivileges`/`ProtectSystem=strict`/
+`PrivateTmp`). The pre-prod gate `test/prodcheck.mjs` re-verifies all of the above.
+
+## 8 · Roadmap (what the market has that we don't)
 TLS-profile proxy shim · cookie-robot/warm-up flows + account vault with TOTP generation ·
 extension manager with central sync · per-profile proxy failover & traffic metering ·
 Playwright/Puppeteer one-click snippets per profile in the Automation tab · profile password lock ·
