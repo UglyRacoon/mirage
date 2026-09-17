@@ -40,7 +40,16 @@ export class BrowserManager {
   }
 
   async launch(profileId, opts = {}) {
+    if (this._launching?.has(profileId)) return this._launching.get(profileId);
     if (this.isRunning(profileId)) return this.sessions.get(profileId).public();
+    // Serialize in-flight launches of the SAME profile: two concurrent requests (REST + automation
+    // API, double-click on ▶) previously both passed the isRunning check, reserved the session slot
+    // and each spawned a kernel on the same user-data-dir (SingletonLock, double proxy relay).
+    const promise = this._launch(profileId, opts).finally(() => this._launching?.delete(profileId));
+    (this._launching ||= new Map()).set(profileId, promise);
+    return promise;
+  }
+  async _launch(profileId, opts = {}) {
     if (this.sessions.size >= (this.global.maxSessions || 3)) throw new Error('Max concurrent sessions reached (' + this.global.maxSessions + ')');
     const profile = this.getProfile(profileId);
     if (!profile) throw new Error('Profile not found');
@@ -372,7 +381,15 @@ export class BrowserManager {
   }
   async layoutMetrics(profileId) {
     const s = this._need(profileId); const t = this._pick(s);
-    try { const m = await s.cdp.send('Page.getLayoutMetrics', {}, t.sessionId); return { w: m.cssVisualViewport?.width || 1280, h: m.cssVisualViewport?.height || 720 }; } catch (e) { return { w: 1280, h: 720 }; }
+    try {
+      const m = await s.cdp.send('Page.getLayoutMetrics', {}, t.sessionId);
+      // CDP VisualViewport exposes clientWidth/clientHeight, not width/height.
+      // A silent 1280x720 fallback misroutes clicks whenever the viewport differs.
+      return {
+        w: m.cssVisualViewport?.clientWidth || m.cssLayoutViewport?.clientWidth || 1280,
+        h: m.cssVisualViewport?.clientHeight || m.cssLayoutViewport?.clientHeight || 720,
+      };
+    } catch (e) { return { w: 1280, h: 720 }; }
   }
   async evaluate(profileId, expression, targetId = null) {
     const s = this._need(profileId); const t = (targetId && s.targets.get(targetId)) || this._pick(s);
@@ -393,7 +410,9 @@ export class BrowserManager {
     }
     await s.cdp.send('Input.dispatchMouseEvent', {
       type: ev.type, x, y,
-      button: ev.type === 'mouseMoved' ? 'none' : (ev.button || 'left'),
+      button: ev.type === 'mouseMoved'
+        ? ((ev.buttons & 1) ? 'left' : (ev.buttons & 2) ? 'right' : (ev.buttons & 4) ? 'middle' : 'none')
+        : (ev.button || 'left'),
       clickCount: ev.clickCount || (ev.type === 'mousePressed' ? 1 : 0),
       buttons: ev.buttons ?? (ev.type === 'mousePressed' ? 1 : 0),
       deltaX: ev.deltaX || 0, deltaY: ev.deltaY || 0, pointerType: 'mouse',
@@ -595,7 +614,7 @@ export class BrowserManager {
     }
     if (sess.xvfb) { try { sess.xvfb.kill('SIGTERM'); } catch (e) { } }
     if (sess.relay) { try { sess.relay.close(); } catch (e) { } }
-    this.sessions.delete(sess.profileId);
+    if (this.sessions.get(sess.profileId) === sess) this.sessions.delete(sess.profileId);
     this.db.logEvent('close', { profileId: sess.profileId, meta: { reason } });
     this.hub.broadcast('live:' + sess.profileId, { type: 'closed' });
     this._emitApp();

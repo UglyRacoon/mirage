@@ -19,8 +19,15 @@ fail() { FAIL=$((FAIL+1)); printf '\033[31mFAIL\033[0m %s\n' "$*"; }
 check() { if [[ "$2" == "$3" ]]; then pass "$1"; else fail "$1 (expected '$2', got '$3')"; fi; }
 
 cleanup() {
-    kill "$(cat "$TMP/etc/mirage/mirage.pid" 2>/dev/null)" 2>/dev/null || true
-    pkill -f "src/index.js" 2>/dev/null || true
+    local pid cwd
+    pid="$(cat "$TMP/etc/mirage/mirage.pid" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); then
+        cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+        # Never signal a process outside this fixture (including a reused PID).
+        if [[ "$cwd" == "$TMP/"* ]]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    fi
     rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -30,8 +37,12 @@ mkdir -p "$TMP/etc/mirage" "$TMP/units" "$TMP/backups" "$TMP/src"
 
 # a local "origin" built from the repo under test (fresh history, never shallow)
 mkdir -p "$TMP/origin_src"
-cp -a "$REPO_SRC/." "$TMP/origin_src/"
-rm -rf "$TMP/origin_src/.git"
+# Copy only versioned source, including current tracked edits; never runtime data/secrets.
+while IFS= read -r -d '' file; do
+    [[ -f "$REPO_SRC/$file" ]] || continue
+    mkdir -p "$TMP/origin_src/$(dirname "$file")"
+    cp -p "$REPO_SRC/$file" "$TMP/origin_src/$file"
+done < <(git -C "$REPO_SRC" ls-files -z)
 git -C "$TMP/origin_src" init --quiet -b main
 git -C "$TMP/origin_src" config user.email t@t
 git -C "$TMP/origin_src" config user.name t
@@ -47,6 +58,8 @@ mkdir -p "$TMP/decoy/mirage/src" && printf 'not mirage\n' >"$TMP/decoy/mirage/sr
 # --------------------------------------------------------------- harness
 export REPO="$TMP/origin_src"
 export APP_DIR="$TMP/app"
+export MIRAGE_DATA="$TMP/app/data"
+export HOST=127.0.0.1
 export PORT
 export MIRAGE_STATE_FILE="$TMP/etc/mirage/install.conf"
 export MIRAGE_STATE_DIR="$TMP/etc/mirage"

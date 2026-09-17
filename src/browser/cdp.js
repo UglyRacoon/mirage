@@ -26,13 +26,21 @@ export class CDP extends EventEmitter {
       ws.onopen = () => { clearTimeout(to); this.connected = true; resolve(); };
       ws.onerror = (e) => { clearTimeout(to); reject(new Error('CDP ws error')); };
       ws.onmessage = (ev) => this._onMsg(typeof ev.data === 'string' ? ev.data : ev.data.toString());
-      ws.onclose = () => { this.connected = false; this.emit('disconnected'); for (const p of this.pending.values()) p.reject(new Error('CDP closed')); this.pending.clear(); };
+      ws.onclose = () => {
+        this.connected = false;
+        // Route lifecycle through the same custom-listener path as protocol events,
+        // so manager subscriptions registered via on() actually fire.
+        for (const l of this._listeners) if (l.method === 'disconnected') { try { l.cb(); } catch (e) { } }
+        this.emit('disconnected');
+        for (const p of this.pending.values()) p.reject(new Error('CDP closed')); this.pending.clear();
+      };
     });
   }
   _onMsg(raw) {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
     if (msg.id && this.pending.has(msg.id)) {
-      const { resolve, reject } = this.pending.get(msg.id); this.pending.delete(msg.id);
+      const { resolve, reject, timer } = this.pending.get(msg.id); this.pending.delete(msg.id);
+      if (timer) { clearTimeout(timer); }
       if (msg.error) reject(Object.assign(new Error(msg.error.message), { cdpCode: msg.error.code })); else resolve(msg.result);
       return;
     }
@@ -47,9 +55,10 @@ export class CDP extends EventEmitter {
       const id = this.nextId++;
       const payload = { id, method, params };
       if (sessionId) payload.sessionId = sessionId;
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => { if (this.pending.has(id)) { this.pending.delete(id); reject(new Error('CDP timeout ' + method)); } }, 25000);
+      if (timer.unref) timer.unref();
+      this.pending.set(id, { resolve, reject, timer });
       this.ws.send(JSON.stringify(payload));
-      setTimeout(() => { if (this.pending.has(id)) { this.pending.delete(id); reject(new Error('CDP timeout ' + method)); } }, 25000);
     });
   }
   on(method, cb, sessionId = undefined) {

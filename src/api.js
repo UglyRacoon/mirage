@@ -251,7 +251,14 @@ export function createApi(ctx) {
   H['DELETE /api/groups/:id'] = (req, res, p) => { if (!canWrite(req, res)) return; db.deleteGroup(p.id); ok(res, { ok: true }); };
 
   // ---------------- proxies ----------------
-  H['GET /api/proxies'] = (req, res) => ok(res, { proxies: db.listProxies() });
+  // Lists never expose stored passwords. PUT preserves an omitted password;
+  // an explicit empty string still clears it (the editor distinguishes both).
+  const proxyShape = (px) => {
+    if (!px) return px;
+    const { pass, ...out } = px;
+    return { ...out, has_auth: !!(px.user || pass) };
+  };
+  H['GET /api/proxies'] = (req, res) => ok(res, { proxies: db.listProxies().map(px => proxyShape(px)) });
   H['POST /api/proxies'] = (req, res, _p, body) => { if (!canWrite(req, res)) return; const pr = db.saveProxy({ id: body.id, label: body.label, scheme: (body.scheme || 'http').toLowerCase(), host: body.host, port: body.port, user: body.user, pass: body.pass, country: body.country || '', city: body.city || '', note: body.note || '', rotator: body.rotator }); ok(res, { proxy: pr }); };
   H['PUT /api/proxies/:id'] = (req, res, p, body) => { if (!canWrite(req, res)) return; const cur = db.getProxy(p.id); if (!cur) return err(res, 404, 'not found'); const merged = { ...cur, ...body, id: cur.id }; db.saveProxy(merged); ok(res, { proxy: db.getProxy(p.id) }); };
   H['DELETE /api/proxies/:id'] = (req, res, p) => { if (!canWrite(req, res)) return; db.deleteProxy(p.id); ok(res, { ok: true }); };
@@ -336,8 +343,9 @@ export function createApi(ctx) {
   H['GET /api/browser/list'] = (req, res) => ok(res, { sessions: bm.list() });
   H['GET /api/browser/status'] = async (req, res) => ok(res, { status: await bm.status() });
   H['GET /api/browser/tabs'] = (req, res) => { const q = new URL(req.url, 'http://x').searchParams; const pid = q.get('profileId'); if (!pid) return err(res, 400, 'profileId'); try { ok(res, { tabs: bm.tabs(pid) }); } catch (e) { err(res, 400, e.message); } };
-  H['POST /api/browser/navigate'] = async (req, res, _p, body) => { try { await bm.navigate(body.profileId, body.url); ok(res, { ok: true }); } catch (e) { err(res, 400, e.message); } };
+  H['POST /api/browser/navigate'] = async (req, res, _p, body) => { if (!canOperate(req, res)) return; try { await bm.navigate(body.profileId, body.url); ok(res, { ok: true }); } catch (e) { err(res, 400, e.message); } };
   H['POST /api/browser/tab'] = async (req, res, _p, body) => {
+    if (!canOperate(req, res)) return;
     try {
       if (body.action === 'new') { const id = await bm.newTab(body.profileId, body.url); ok(res, { targetId: id }); }
       else if (body.action === 'close') { await bm.closeTab(body.profileId, body.targetId); ok(res, { ok: true }); }
@@ -351,6 +359,7 @@ export function createApi(ctx) {
   };
   H['GET /api/browser/screenshot/:profileId'] = async (req, res, p) => { try { const d = await bm.screenshot(p.profileId); json(res, 200, { dataUrl: 'data:image/jpeg;base64,' + d }); } catch (e) { err(res, 400, e.message); } };
   H['POST /api/browser/cookies'] = async (req, res, _p, body) => {
+    if (!canOperate(req, res)) return;
     try {
       if (body.action === 'get') return ok(res, { cookies: await bm.cookies(body.profileId) });
       if (body.action === 'set') { await bm.setCookies(body.profileId, body.cookies || []); return ok(res, { ok: true }); }
@@ -358,7 +367,7 @@ export function createApi(ctx) {
       if (body.action === 'snapshot') return ok(res, await bm.snapshot(body.profileId));
     } catch (e) { err(res, 400, e.message); }
   };
-  H['GET /api/browser/cookies/:profileId'] = async (req, res, p) => { try { ok(res, { cookies: await bm.cookies(p.profileId) }); } catch (e) { err(res, 400, e.message); } };
+  H['GET /api/browser/cookies/:profileId'] = async (req, res, p) => { if (!canOperate(req, res)) return; try { ok(res, { cookies: await bm.cookies(p.profileId) }); } catch (e) { err(res, 400, e.message); } };
   H['GET /api/browser/history/:profileId'] = (req, res, p) => ok(res, { history: db.listHistory(p.profileId, 200) });
   H['GET /api/profiles/:id/snapshots'] = (req, res, p) => ok(res, { snapshots: bm.snapshots(p.id) });
   H['POST /api/snapshots/restore'] = async (req, res, _p, body) => {
@@ -501,6 +510,7 @@ export function createApi(ctx) {
 
   // ---------------- backup ----------------
   H['GET /api/backup/export'] = (req, res) => {
+    if (!need(req, res, ['admin'])) return;
     const dump = { version: 1, exportedAt: now(), profiles: db.listProfiles(), groups: db.listGroups(), proxies: db.listProxies(), members: db.listMembers(), settings: getSettings() };
     const b = JSON.stringify(dump, null, 2);
     res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Disposition': `attachment; filename="mirage-backup-${now()}.json"`, 'Content-Length': Buffer.byteLength(b) }); res.end(b);

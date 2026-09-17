@@ -450,7 +450,7 @@ function proxyForm(px = null, onDone) {
       </div>
       <div class="row2">
         <div><label>User</label><input id="pxUser" value="${App.esc(px?.user || '')}"></div>
-        <div><label>Password</label><input id="pxPass" type="text" value="${App.esc(px?.pass || '')}"></div>
+        <div><label>Password</label><input id="pxPass" type="password" value="" placeholder="${isNew ? '' : 'Stored password unchanged unless edited'}" oninput="this.dataset.changed='1'"></div>
       </div>
       <div class="row2">
         <div><label>Country</label><input id="pxCountry" value="${App.esc(px?.country || '')}" placeholder="US"></div>
@@ -459,12 +459,12 @@ function proxyForm(px = null, onDone) {
       <label class="switch"><input type="checkbox" id="pxRot" ${px?.rotator ? 'checked' : ''}><i></i><span class="mut">Rotator endpoint (one IP per session)</span></label>
       <div id="pxTestOut"></div>
     </div>`, actions: [
-      { label: 'Test first', onClick: ({ bodyEl }) => { const o = bodyEl.querySelector('#pxTestOut'); o.innerHTML = '<span class="spin"></span> probing…'; guard(async () => { const r = await api('/api/proxies/test', { method: 'POST', body: proxyBody(bodyEl) }); o.innerHTML = r.ok ? `<div class="issue info">✓ ${r.latencyMs}ms · exit <b>${App.esc(r.exitIp)}</b> · ${App.esc(r.geo?.country || '?')} ${App.esc(r.geo?.city || '')} · ${App.esc(r.geo?.isp || '')} ${r.geo?.hosting ? '(<span class="warn-c">datacenter</span>)' : '(residential?)'} · proxy=${r.geo?.proxy ? 'yes' : 'no'}</div>` : `<div class="issue critical">✗ ${App.esc(r.error || 'unreachable')}</div>`; }); return true; } },
+      { label: 'Test first', onClick: ({ bodyEl }) => { const o = bodyEl.querySelector('#pxTestOut'); o.innerHTML = '<span class="spin"></span> probing…'; guard(async () => { const r = await api(!isNew && !bodyEl.querySelector('#pxPass').dataset.changed ? '/api/proxies/' + px.id + '/probe' : '/api/proxies/test', { method: 'POST', body: proxyBody(bodyEl) }); o.innerHTML = r.ok ? `<div class="issue info">✓ ${r.latencyMs}ms · exit <b>${App.esc(r.exitIp)}</b> · ${App.esc(r.geo?.country || '?')} ${App.esc(r.geo?.city || '')} · ${App.esc(r.geo?.isp || '')} ${r.geo?.hosting ? '(<span class="warn-c">datacenter</span>)' : '(residential?)'} · proxy=${r.geo?.proxy ? 'yes' : 'no'}</div>` : `<div class="issue critical">✗ ${App.esc(r.error || 'unreachable')}</div>`; }); return true; } },
       { label: isNew ? 'Add proxy' : 'Save', kind: 'primary', onClick: async ({ bodyEl }) => { const b = proxyBody(bodyEl); if (!b.host || !b.port) throw new Error('host + port required'); await api(isNew ? '/api/proxies' : '/api/proxies/' + px.id, { method: isNew ? 'POST' : 'PUT', body: b }); await refreshAll(); onDone?.(); toast(isNew ? 'Proxy added' : 'Saved', 'ok'); } },
     ] });
 }
 function proxyBody(root) {
-  return { label: root.querySelector('#pxLabel').value, scheme: root.querySelector('#pxScheme').value, host: root.querySelector('#pxHost').value.trim(), port: +root.querySelector('#pxPort').value, user: root.querySelector('#pxUser').value, pass: root.querySelector('#pxPass').value, country: root.querySelector('#pxCountry').value, city: root.querySelector('#pxCity').value, rotator: root.querySelector('#pxRot').checked ? 1 : 0 };
+  return { label: root.querySelector('#pxLabel').value, scheme: root.querySelector('#pxScheme').value, host: root.querySelector('#pxHost').value.trim(), port: +root.querySelector('#pxPort').value, user: root.querySelector('#pxUser').value, pass: root.querySelector('#pxPass').dataset.changed ? root.querySelector('#pxPass').value : undefined, country: root.querySelector('#pxCountry').value, city: root.querySelector('#pxCity').value, rotator: root.querySelector('#pxRot').checked ? 1 : 0 };
 }
 function importProxies(onDone) {
   modal({ title: 'Bulk import proxies', body: `<label>One per line — <span class="mono">host:port</span>, <span class="mono">user:pass@host:port</span>, <span class="mono">host:port:user:pass</span> or <span class="mono">socks5://user:pass@host:port</span></label>
