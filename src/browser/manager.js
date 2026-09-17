@@ -286,7 +286,12 @@ export class BrowserManager {
 
   _pick(sess) {
     const pages = Array.from(sess.targets.values()).filter(t => t.type === 'page' && t._ov);
-    const t = sess.activeTargetId && pages.find(p => p.sessionId === sess.activeTargetId) || pages[pages.length - 1];
+    // Сначала ищем активную вкладку по firstTargetId (который обновляется при activateTab)
+    const activePage = pages.find(p => {
+      const entry = Array.from(sess.targets.entries()).find(([id, v]) => v.sessionId === p.sessionId);
+      return entry && entry[0] === sess.firstTargetId;
+    });
+    const t = activePage || (sess.activeTargetId && pages.find(p => p.sessionId === sess.activeTargetId)) || pages[pages.length - 1];
     if (!t) throw new Error('No ready page target');
     return t;
   }
@@ -320,9 +325,15 @@ export class BrowserManager {
   async closeTab(profileId, targetId) { const s = this._need(profileId); await s.cdp.send('Target.closeTarget', { targetId }).catch(() => { }); }
   async activateTab(profileId, targetId) {
     const s = this._need(profileId);
+    // Update firstTargetId so _broadcastTargets marks the correct tab as active
+    if (s.targets.has(targetId)) {
+      s.firstTargetId = targetId;
+    }
     s.activeTargetId = Array.from(s.targets.entries()).find(([id]) => id === targetId)?.[1]?.sessionId || s.activeTargetId;
     await s.cdp.send('Target.activateTarget', { targetId }).catch(() => { });
     if (s.screencastOn && s._nativeScreencast) { await this.stopLive(profileId); this.startLive(profileId, { fps: this.global.liveFps || 6 }); }
+    // Broadcast updated targets so UI highlights the new active tab
+    this._broadcastTargets(s);
   }
   tabs(profileId) { const s = this._need(profileId); return Array.from(s.targets.entries()).filter(([, v]) => v.type === 'page').map(([id, v]) => ({ id, url: v.url, title: v.title })); }
 
@@ -354,9 +365,14 @@ export class BrowserManager {
   }
   async inputKey(profileId, ev) {
     const s = this._need(profileId); const t = this._pick(s); s._lastInput = Date.now();
-    if (ev.type === 'char' || (ev.type === 'keyDown' && ev.text && ev.key && ev.key.length === 1)) {
+    // Для печатных символов используем insertText только один раз при keyDown
+    if (ev.type === 'keyDown' && ev.text && ev.key && ev.key.length === 1) {
+      await s.cdp.send('Input.insertText', { text: ev.text }, t.sessionId).catch(() => { });
+      return; // Не отправляем dispatchKeyEvent для печатных символов
+    }
+    if (ev.type === 'char') {
       await s.cdp.send('Input.insertText', { text: ev.text || ev.key }, t.sessionId).catch(() => { });
-      if (ev.type === 'char') return;
+      return;
     }
     await s.cdp.send('Input.dispatchKeyEvent', { type: ev.type, key: ev.key, code: ev.code, text: ev.text, modifiers: ev.modifiers || 0, windowsVirtualKeyCode: vkc(ev.key), nativeVirtualKeyCode: vkc(ev.key) }, t.sessionId);
   }
