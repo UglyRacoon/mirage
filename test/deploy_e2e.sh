@@ -207,6 +207,32 @@ check "discovered the new path" "$moved" "$FOUND_DIR"
 APP_DIR="$moved"
 check "marker carried over" "$TMP/app" "$(marker_get "$moved" app_dir)"
 
+echo "== 6. an install under a non-ASCII path (like ~/Документы/mirage) =="
+ru_path="$TMP/Документы/mirage"          # Cyrillic path, as in the field report
+mkdir -p "$(dirname "$ru_path")"
+git clone --quiet "$TMP/origin_src" "$ru_path"
+# a unit named as in the field, pointing at the Cyrillic path
+cat >"$TMP/units/mirage.service" <<EOF
+[Unit]
+Description=Mirage anti-detect browser
+[Service]
+User=user
+WorkingDirectory=$ru_path
+Environment=PORT=$PORT
+ExecStart=$NODE_BIN $ru_path/src/index.js
+[Install]
+WantedBy=multi-user.target
+EOF
+APP_DIR_ENV=""; MIRAGE_COMMON_DIRS="$ru_path"; APP_DIR=""
+if find_mirage_dir; then pass "Cyrillic install found"; else fail "Cyrillic install not found"; fi
+check "Cyrillic path detected" "$ru_path" "$FOUND_DIR"
+check "unit ExecStart path parsed" "$ru_path" "$(unit_exec_dir "$TMP/units/mirage.service")"
+resolve_installation
+check "port read from that unit" "$PORT" "$PORT"
+APP_DIR="$ru_path"; REPO="$TMP/origin_src"
+if validate_payload "$ru_path" >"$TMP/validate_ru.log" 2>&1; then pass "release validates on the Cyrillic path"; else fail "validation failed: $(tail -4 "$TMP/validate_ru.log")"; fi
+if wait_health; then pass "still serving on the old install"; else fail "service down after the Cyrillic test"; fi
+
 echo
 printf 'deploy.sh e2e: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
