@@ -103,8 +103,10 @@ async function main() {
       if (msg.type === 'input' && msg.channel?.startsWith?.('live:')) {
         if (!canOperateWs) return conn.sendJSON({ type: 'error', error: 'viewer cannot control kernels' });
         const pid = msg.channel.slice(5); const ev = msg.ev || {};
-        // fire-and-forget, but never silently: recurring failures surface in the log (throttled)
-        const run = (p) => { Promise.resolve(p).catch(e => noteInputError(pid, e)); };
+        // fire-and-forget, but never silently: first receipt + first CDP ack are logged once
+        // per profile (proves browser→server→kernel), failures surface throttled below.
+        if (!_inputSeen.has(pid)) { _inputSeen.add(pid); log('live-input', pid + ': receiving input (' + (ev.kind || '?') + '/' + (ev.type || ev.action || '?') + ')'); }
+        const run = (p) => { Promise.resolve(p).then(() => noteInputOk(pid, ev), e => noteInputError(pid, e)); };
         try {
           if (ev.kind === 'mouse' || ev.kind === 'touch') run(bm.inputMouse(pid, ev));
           else if (ev.kind === 'key') run(bm.inputKey(pid, ev));

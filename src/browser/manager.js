@@ -223,11 +223,15 @@ export class BrowserManager {
   _onAttached(sess, p) {
     const { sessionId, targetInfo } = p;
     const release = () => { try { sess.cdp.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => { }); } catch (e) { } };
-    if (targetInfo.type !== 'page') { if (targetInfo.type === 'other' || targetInfo.type === 'shared_worker' || targetInfo.type === 'service_worker') release(); return; }
+    // Non-page targets have nothing to patch — resume them immediately. With
+    // waitForDebuggerOnStart every attach starts paused, and a paused target left hanging
+    // (browser/worker/etc.) wedges later CDP traffic, surfacing as mass "CDP timeout"
+    // failures for every other session.
+    if (targetInfo.type !== 'page') { release(); return; }
     sess.targets.set(targetInfo.targetId, { sessionId, type: targetInfo.type, url: targetInfo.url, title: targetInfo.title, ready: false, _ov: false });
     this._applyOverrides(sess, sess.targets.get(targetInfo.targetId))
       .then(() => { const t = sess.targets.get(targetInfo.targetId); if (t) { t.ready = true; } this._broadcastTargets(sess); })
-      .catch(e => warn('browser', 'override failed:', e.message))
+      .catch(e => warn('browser', `override failed [${sess.profileId}/${targetInfo.targetId.slice(0, 8)} ${targetInfo.url || ''}]:`, e.message))
       .finally(() => release()); // never leave a page frozen
   }
   _onTargetInfo(sess, p) {
@@ -252,7 +256,12 @@ export class BrowserManager {
     try {
       await c.send('Page.enable', {}, sid);
       await c.send('Network.enable', {}, sid);
-      await c.send('Page.addScriptToEvaluateOnNewDocument', { source: sess.stealth, runImmediately: true }, sid);
+      // NOTE: no runImmediately — this session is debugger-paused (waitForDebuggerOnStart)
+      // and immediate evaluation of a ~46KB bundle in a paused renderer hangs on some
+      // Chromium builds (25s CDP timeout → target never becomes ready → no input/stream).
+      // Registration alone is sufficient: our flow always navigates AFTER attach completes,
+      // so the script is in place before any real page script runs.
+      await c.send('Page.addScriptToEvaluateOnNewDocument', { source: sess.stealth }, sid);
       const ch = fp.clientHints;
       const meta = (ch && ch.supported) ? {
         brands: ch.brands, fullVersionList: ch.fullVersionList, mobile: !!ch.mobile, platform: ch.platform,
@@ -396,6 +405,7 @@ export class BrowserManager {
     if (ev.type === 'char') {
       // multi-char paste from the system clipboard — insert verbatim, no key events
       await s.cdp.send('Input.insertText', { text: ev.text ?? ev.key ?? '' }, t.sessionId).catch(() => { });
+      s.inputCount = (s.inputCount || 0) + 1; s.lastInputEv = 'char';
       return;
     }
     // Full dispatchKeyEvent pairs (keyDown with text → keyUp), so pages see realistic keydown /
@@ -595,6 +605,7 @@ export class BrowserManager {
       profileId: s.profileId, status: s._cleaned ? 'stopped' : (s.child && s.child.exitCode === null ? s.status : 'stopping'),
       mode: s.mode, display: s.display, endpoint: s.dbgPort ? `ws://127.0.0.1:${s.dbgPort}` : null, port: s.dbgPort || null,
       screencastOn: !!s.screencastOn, screenshots: s.screenshots || 0, fresh: !!s.fresh,
+      inputCount: s.inputCount || 0, lastInputEv: s.lastInputEv || null,
       proxy: s.proxyUsed ? `${s.proxyUsed.scheme}://${s.proxyUsed.host}:${s.proxyUsed.port}` : 'direct',
       up: Math.round((Date.now() - s._start) / 1000),
       tabs: Array.from(s.targets.values()).filter(t => t.type === 'page').map(t => ({ url: t.url, title: t.title })),

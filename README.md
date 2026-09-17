@@ -279,7 +279,7 @@ public/ SPA ──HTTP /api/*──> src/api.js (route table, RBAC, AdsPower-com
                                           │   data/browsers/<id> (--user-data-dir)
                                           │   :0 headed or Xvfb "cloud mode"
                                           ├─ stealth bundle injected pre-page-script:
-                                          │   Page.addScriptToEvaluateOnNewDocument(runImmediately)
+                                          │   Page.addScriptToEvaluateOnNewDocument (registered pre-navigation)
                                           │   + attach PAUSED (waitForDebuggerOnStart) → override → runIfWaitingForDebugger
                                           └─ proxy relay (src/browser/proxyrelay.js):
                                               localhost HTTP CONNECT/SOCKS5 gateway
