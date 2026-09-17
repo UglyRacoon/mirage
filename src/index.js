@@ -115,8 +115,16 @@ async function main() {
             if (ev.action === 'copy' || ev.action === 'cut') {
               run((async () => {
                 // read the selection BEFORE cutting (cut collapses it — order matters)
-                const text = await bm.evaluate(pid, 'document.getSelection()?.toString() || ""');
-                hub.broadcast(msg.channel, { type: 'clipboard', action: 'copy', text: text || '' });
+                const text = await bm.evaluate(pid, `(() => {
+                  const el = document.activeElement;
+                  if (el?.type === 'password') return '';
+                  if (el && typeof el.selectionStart === 'number' && typeof el.selectionEnd === 'number') {
+                    return el.value.slice(el.selectionStart, el.selectionEnd);
+                  }
+                  return document.getSelection()?.toString() || '';
+                })()`);
+                // Clipboard contents belong to the requesting client, not all live viewers.
+                conn.sendJSON({ type: 'clipboard', action: 'copy', text: text || '' });
                 if (ev.action === 'cut') {
                   const mods = ev.modifiers ?? 2;
                   await bm.inputKey(pid, { type: 'keyDown', key: 'x', code: 'KeyX', modifiers: mods });

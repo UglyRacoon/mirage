@@ -41,16 +41,18 @@ async function handleClipboard(m) {
       await navigator.clipboard.writeText(m.text);
       toast('Copied to system clipboard', 'ok');
     } catch (e) {
-      // Fallback для старых браузеров
+      // A WebSocket reply may arrive after user activation expires. Try legacy copy,
+      // but show selectable text if the host denies it; never report a false success.
+      const previousFocus = document.activeElement;
       const ta = document.createElement('textarea');
-      ta.value = m.text;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand('copy'); toast('Copied to system clipboard', 'ok'); }
-      catch (e2) { toast('Copy failed: ' + e2.message, 'err'); }
+      ta.value = m.text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      let done = false;
+      try { done = document.execCommand('copy'); } catch (_) { }
       document.body.removeChild(ta);
+      previousFocus?.focus({ preventScroll: true });
+      if (done) toast('Copied to system clipboard', 'ok');
+      else modal({ title: 'Copy failed', body: `<p class="mut">Браузер запретил доступ к буферу (нужен HTTPS или разрешение). Скопируйте вручную:</p><textarea class="code" rows="6" style="width:100%">${App.esc(m.text)}</textarea>`, actions: [{ label: 'Close' }] });
     }
   }
 }
@@ -226,23 +228,27 @@ ROUTES.live = (view, params) => {
     wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: e.pointerType === 'touch' && e.buttons ? 'touch' : 'mouse', type: 'mouseMoved', ...p, button: 'none', buttons: e.buttons || 0, pointerType: e.pointerType || 'mouse' } });
   });
   img.addEventListener('wheel', e => { if (!focused) capture(); e.preventDefault(); const p = toCSS(e); wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'wheel', ...p, deltaX: e.deltaX, deltaY: e.deltaY } }); }, { passive: false });
+  // Native paste events expose text even on HTTP origins where navigator.clipboard is
+  // unavailable. Do not cancel Ctrl/Cmd+V: let the host browser deliver that trusted event.
+  stage.addEventListener('paste', e => {
+    if (!focused) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const text = e.clipboardData?.getData('text/plain') || '';
+    if (text) wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'clipboard', action: 'paste', text } });
+  });
   stage.addEventListener('keydown', e => {
     if (!focused) return;
     if (e.key === 'Escape') { release(); return; }
+    if ((e.ctrlKey || e.metaKey) && (e.code === 'KeyV' || e.key.toLowerCase() === 'v')) return;
     e.preventDefault();
     const mods = (e.ctrlKey ? 2 : 0) | (e.altKey ? 1 : 0) | (e.shiftKey ? 8 : 0) | (e.metaKey ? 4 : 0);
     const printable = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
 
     // System clipboard sync for Ctrl/⌘+C/X/V (the remote kernel has its own clipboard)
-    if ((e.ctrlKey || e.metaKey) && ['c', 'v', 'x'].includes(e.key.toLowerCase())) {
-      const k = e.key.toLowerCase();
-      if (k === 'v') {
-        // Paste: read the SYSTEM clipboard and insert its text remotely; don't forward the
-        // combo itself or the page would paste its (stale) internal clipboard on top.
-        navigator.clipboard.readText().then(
-          text => { if (text) wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'clipboard', action: 'paste', text } }); },
-          () => toast('Paste failed: clipboard access denied', 'warn'));
-      } else if (k === 'c') {
+    if ((e.ctrlKey || e.metaKey) && (['KeyC', 'KeyX'].includes(e.code) || ['c', 'x'].includes(e.key.toLowerCase()))) {
+      const k = e.code === 'KeyC' ? 'c' : e.code === 'KeyX' ? 'x' : e.key.toLowerCase();
+      if (k === 'c') {
         // Copy: the selection survives, so let the page handle the combo AND mirror the text out
         wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, code: e.code || '', modifiers: mods, repeat: e.repeat } });
         wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'clipboard', action: 'copy', modifiers: mods } });
@@ -261,6 +267,7 @@ ROUTES.live = (view, params) => {
   });
   stage.addEventListener('keyup', e => {
     if (!focused) return;
+    if ((e.ctrlKey || e.metaKey) && (e.code === 'KeyV' || e.key.toLowerCase() === 'v')) return;
     e.preventDefault();
     const mods = (e.ctrlKey ? 2 : 0) | (e.altKey ? 1 : 0) | (e.shiftKey ? 8 : 0) | (e.metaKey ? 4 : 0);
     wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyUp', key: e.key, code: e.code || '', modifiers: mods } });

@@ -9,9 +9,9 @@ import { log, warn } from '../util.js';
  * @param {object} proxy {scheme:http|https|socks5, host, port, user, pass}
  * @returns {Promise<{url:string, port:number, close:()=>void}>}
  */
-export function startRelay(proxy) {
+export function startRelay(proxy, { ownLoopbackPorts = new Set() } = {}) {
   return new Promise((resolve, reject) => {
-    const server = net.createServer((client) => handleClient(client, proxy, reject));
+    const server = net.createServer((client) => handleClient(client, proxy, reject, ownLoopbackPorts));
     server.on('error', reject);
     server.listen(0, '127.0.0.1', () => {
       const port = server.address().port;
@@ -20,20 +20,71 @@ export function startRelay(proxy) {
   });
 }
 
-function handleClient(client, proxy) {
+// Direct dial for Mirage's own loopback services (control plane, JA3 capture listener).
+// `extra` = bytes to flush into the local socket right after connect: for plain-HTTP that is
+// the origin-form request head and body, for CONNECT it is any payload already sent.
+function pipeLocal(client, port, extra, connect = false) {
+  let connected = false;
+  const up = net.connect({ host: '127.0.0.1', port: +port }, () => {
+    if (client.destroyed) { up.destroy(); return; }
+    connected = true;
+    up.setTimeout(0);
+    if (connect) client.write('HTTP/1.1 200 Connection Established\r\nProxy-Agent: MirageRelay\r\n\r\n');
+    if (extra.length) up.write(extra);
+    pipe(client, up);
+  });
+  client.once('close', () => up.destroy());
+  up.setTimeout(4000, () => up.destroy(new Error('local service timeout')));
+  up.on('error', () => {
+    if (connected) client.destroy();
+    else failLocal(client, 'local service unreachable');
+  });
+}
+
+function failLocal(client, message) {
+  client.end('HTTP/1.1 502 Bad Gateway\r\nX-Mirage-Error: ' + message + '\r\nContent-Length: 0\r\nConnection: close\r\n\r\n');
+}
+
+// Keep the shared Set live: capture listeners are added/removed after relay startup.
+// Only aliases for the actual 127.0.0.1 listener may use an allowlisted port.
+function isOwnService(host, port, ports) {
+  return ['127.0.0.1', 'localhost', '::1', '::ffff:7f00:1'].includes(host)
+    && (ports instanceof Set ? ports.has(+port) : ports?.includes(+port));
+}
+
+function canonicalHost(host) {
+  return new URL(`http://${host}`).hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+}
+
+// Loopback destinations must never tunnel through the upstream proxy: "127.0.0.1" would
+// resolve at the PROXY's side, so control-plane pages (the built-in checker at
+// http://127.0.0.1:<port>/checker, JA3 capture) break with ERR_EMPTY_RESPONSE. Mirage's own
+// local services (control-plane port + ephemeral capture ports) are dialed DIRECTLY here;
+// any OTHER loopback target is refused fast with a logged 502 (a page asking the kernel to
+// probe the host's local services is an SSRF probe — it must not succeed through us).
+function isLoopbackTarget(host) {
+  const h = String(host || '').toLowerCase();
+  if (h === 'localhost' || h.endsWith('.localhost') || h === '::1') return true;
+  if (/^127\./.test(h)) return true;
+  if (/^::ffff:(?:127\.|7f[0-9a-f]{2}:)/.test(h)) return true;
+  return false;
+}
+
+function handleClient(client, proxy, reject, ownLoopbackPorts) {
   client.setNoDelay(true);
   let buf = Buffer.alloc(0);
   const onData = (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     const end = buf.indexOf('\r\n\r\n');
     if (end < 0) { if (buf.length > 65536) client.destroy(); return; }
+    client.pause(); // retain body/tunnel bytes arriving while the destination connects
     client.removeListener('data', onData);
     const head = buf.subarray(0, end).toString('latin1');
     const rest = buf.subarray(end + 4);
     const [line] = head.split('\r\n');
     const [method, target] = line.split(/\s+/);
-    if (method === 'CONNECT') handleConnect(client, proxy, target, head, rest);
-    else forwardHttp(client, proxy, head, rest);
+    if (method === 'CONNECT') handleConnect(client, proxy, target, head, rest, ownLoopbackPorts);
+    else forwardHttp(client, proxy, head, rest, ownLoopbackPorts);
   };
   client.on('data', onData);
   client.on('error', () => client.destroy());
@@ -43,7 +94,8 @@ function upstreamConnect(proxy, host, port) {
   return new Promise((resolve, reject) => {
     if (proxy.scheme === 'socks5') return socks5Connect(proxy, host, +port).then(resolve, reject);
     const up = net.connect({ host: proxy.host, port: +proxy.port, timeout: 12000 }, () => {
-      let hdr = `CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n`;
+      const authority = `${net.isIPv6(host) ? '[' + host + ']' : host}:${port}`;
+      let hdr = `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n`;
       if (proxy.user) hdr += `Proxy-Authorization: Basic ${Buffer.from(proxy.user + ':' + (proxy.pass || '')).toString('base64')}\r\n`;
       hdr += '\r\n';
       up.write(hdr);
@@ -115,8 +167,23 @@ function socks5Connect(proxy, host, port) {
   });
 }
 
-async function handleConnect(client, proxy, target, head, rest) {
-  const [host, port] = target.split(':');
+async function handleConnect(client, proxy, target, head, rest, ownLoopbackPorts) {
+  // CONNECT uses authority-form: IPv6 must be bracketed, and the port explicit.
+  const authority = /^(\[[0-9a-fA-F:.]+\]|[^\s:/?#@\\]+):(\d+)$/.exec(target || '');
+  let host, port;
+  try {
+    if (!authority || +authority[2] < 1 || +authority[2] > 65535) throw new Error('invalid authority');
+    host = canonicalHost(authority[1]); port = +authority[2];
+  } catch { failLocal(client, 'invalid CONNECT target'); return; }
+  if (isLoopbackTarget(host)) {   // never tunnel loopback (see isLoopbackTarget)
+    if (isOwnService(host, port, ownLoopbackPorts)) {
+      pipeLocal(client, port, rest, true);
+      return;
+    }
+    warn('relay', 'refusing loopback CONNECT to ' + host + ':' + port + ' (SSRF probe)');
+    failLocal(client, 'loopback is not proxied');
+    return;
+  }
   try {
     const { sock, head: leftover } = await upstreamConnect(proxy, host, port || 443);
     client.write('HTTP/1.1 200 Connection Established\r\nProxy-Agent: MirageRelay\r\n\r\n');
@@ -124,18 +191,35 @@ async function handleConnect(client, proxy, target, head, rest) {
     if (rest && rest.length) sock.write(rest);
     pipe(client, sock);
   } catch (e) {
+    warn('relay', 'CONNECT failed:', e.message);
     client.write('HTTP/1.1 502 Bad Gateway\r\nX-Mirage-Error: ' + String(e.message).replace(/\r?\n/g, ' ') + '\r\nContent-Length: 0\r\n\r\n');
     client.destroy();
   }
 }
 
-async function forwardHttp(client, proxy, head, rest) {
+async function forwardHttp(client, proxy, head, rest, ownLoopbackPorts) {
   // plain http:// forwarding (for non-TLS requests)
   const lines = head.split('\r\n');
   const hostLine = lines[0].split(/\s+/);
-  let u; try { u = new URL(hostLine[1]); } catch { client.destroy(); return; }
+  let u, host;
+  try {
+    u = new URL(hostLine[1]);
+    if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) throw new Error('invalid URL');
+    host = canonicalHost(u.hostname);
+  } catch { failLocal(client, 'invalid HTTP target'); return; }
   const port = u.port || (u.protocol === 'https:' ? 443 : 80);
   const originForm = `${hostLine[0]} ${u.pathname + u.search} ${hostLine[2] || 'HTTP/1.1'}`;
+  if (isLoopbackTarget(host)) {   // never tunnel loopback (see isLoopbackTarget)
+    if (u.protocol === 'http:' && isOwnService(host, port, ownLoopbackPorts)) {
+      const headers = lines.slice(1).filter(l => !/^Proxy-(?:Authorization|Connection):/i.test(l));
+      const extra = Buffer.concat([Buffer.from([originForm, ...headers, '', ''].join('\r\n'), 'latin1'), rest]);
+      pipeLocal(client, port, extra);
+      return;
+    }
+    warn('relay', 'refusing loopback request to ' + host + ':' + port + ' (SSRF probe)');
+    failLocal(client, 'loopback is not proxied');
+    return;
+  }
   if (proxy.scheme === 'socks5') {
     // wrap request through the socks tunnel (origin-form)
     try {
@@ -147,7 +231,7 @@ async function forwardHttp(client, proxy, head, rest) {
       if (leftover && leftover.length) sock.write(rest);
       if (rest && rest.length) sock.write(rest);
       pipe(client, sock);
-    } catch (e) { client.destroy(); }
+    } catch (e) { warn('relay', 'upstream failed:', e.message); client.destroy(); }
     return;
   }
   let out = `${originForm}\r\n`;

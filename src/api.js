@@ -215,18 +215,31 @@ export function createApi(ctx) {
   // kernel's network fingerprint (shaping it is a kernel-level moat; see README §4).
   const tlsCaptureCache = new Map();
   async function captureJA3(profileId) {
-    let server;
-    const got = await new Promise((resolve) => {
-      server = net.createServer(sock => { sock.once('data', d => { sock.destroy(); resolve(d); }); sock.on('error', () => { }); });
-      server.on('error', () => resolve(null));
-      server.listen(0, '127.0.0.1', async () => {
-        const p = server.address().port;
-        try { await bm.navigate(profileId, `https://127.0.0.1:${p}/ja3`); } catch (e) { }
-        setTimeout(() => resolve(null), 4000);
+    let server, port, timer;
+    const sockets = new Set();
+    try {
+      const got = await new Promise((resolve) => {
+        server = net.createServer(sock => {
+          sockets.add(sock);
+          sock.once('close', () => sockets.delete(sock));
+          sock.once('data', d => { sock.destroy(); resolve(d); });
+          sock.on('error', () => { });
+        });
+        server.on('error', () => resolve(null));
+        server.listen(0, '127.0.0.1', async () => {
+          port = server.address().port;
+          bm.addOwnLoopbackPort(port); // shared with relays that are already running
+          timer = setTimeout(() => resolve(null), 4000);
+          try { await bm.navigate(profileId, `https://127.0.0.1:${port}/ja3`); } catch (e) { resolve(null); }
+        });
       });
-    });
-    try { server.close(); } catch (e) { }
-    return got && got.length ? parseClientHello(got) : null;
+      return got && got.length ? parseClientHello(got) : null;
+    } finally {
+      clearTimeout(timer);
+      if (port) bm.removeOwnLoopbackPort(port);
+      for (const sock of sockets) sock.destroy();
+      try { server?.close(); } catch (e) { }
+    }
   }
   H['POST /api/fingerprint/tls-capture/:id'] = async (req, res, p) => {
     const pid = p.id;
@@ -398,14 +411,17 @@ export function createApi(ctx) {
     const port = +(process.env.PORT || 7788);
     try {
       if (!bm.isRunning(p.profileId)) await bm.launch(p.profileId, {});
-      const tabId = await bm.newTab(p.profileId, `http://127.0.0.1:${port}/checker?embed=1&v=${Date.now()}`);
+      const tabId = await bm.newTab(p.profileId, `http://127.0.0.1:${port}/checker?embed=1&v=${Date.now()}`, { background: true });
       const t0 = Date.now();
       let rep = null;
-      while (Date.now() - t0 < 18000) {
-        await new Promise(r => setTimeout(r, 800));
-        try { rep = await bm.evaluate(p.profileId, 'window.__MIRAGE_REPORT || null', tabId); if (rep) break; } catch (e) { }
+      try {
+        while (Date.now() - t0 < 18000) {
+          await new Promise(r => setTimeout(r, 800));
+          try { rep = await bm.evaluate(p.profileId, 'window.__MIRAGE_REPORT || null', tabId); if (rep) break; } catch (e) { }
+        }
+      } finally {
+        await bm.closeTab(p.profileId, tabId).catch(() => { });   // leave no checker-tab litter
       }
-      await bm.closeTab(p.profileId, tabId).catch(() => { });   // leave no checker-tab litter
       if (rep) { db.logEvent('checker', { profileId: p.profileId, meta: { leaks: rep.leaks, score: rep.score } }); return ok(res, rep); }
       err(res, 408, 'checker did not produce a report in time');
     } catch (e) { err(res, 400, e.message); }

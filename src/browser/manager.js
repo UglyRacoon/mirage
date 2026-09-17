@@ -23,7 +23,13 @@ export class BrowserManager {
     this.sessions = new Map();
     this.global = {};
     this._portCursor = 9333;
+    // Loopback ports the relay must serve DIRECTLY (never via the upstream proxy):
+    // the control plane itself + currently active ephemeral JA3 capture listeners.
+    this.ownLoopbackPorts = new Set();
+    this.addOwnLoopbackPort(process.env.PORT || 7788);
   }
+  addOwnLoopbackPort(p) { if (Number.isInteger(+p) && +p > 0 && +p <= 65535) this.ownLoopbackPorts.add(+p); }
+  removeOwnLoopbackPort(p) { this.ownLoopbackPorts.delete(+p); }
   setSettings(s) { this.global = s || {}; }
   findBinary() {
     const cands = [this.global.chromiumPath, process.env.MIRAGE_CHROMIUM, '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable'].filter(Boolean);
@@ -74,7 +80,7 @@ export class BrowserManager {
     try {
       // 1) proxy relay (credentials + DNS leak protection)
       const proxy = resolveProxy(profile, this.db);
-      if (proxy) { sess.relay = await startRelay(proxy); sess.proxyUsed = proxy; }
+      if (proxy) { sess.relay = await startRelay(proxy, { ownLoopbackPorts: this.ownLoopbackPorts }); sess.proxyUsed = proxy; }
 
       // 2.5) GEOfollow: snap GPS + timezone to the proxy's egress location. A profile whose HTTP exit
       //       is in DE but whose GPS says RU (or whose timezone is off) is trivially caught — so the
@@ -328,22 +334,23 @@ export class BrowserManager {
     await s.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: 1, key: key2, code: code2, windowsVirtualKeyCode: vk }, sid).catch(() => { });
     await s.cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', modifiers: 1, key, code, windowsVirtualKeyCode: 18 }, sid).catch(() => { });
   }
-  async newTab(profileId, url) {
+  async newTab(profileId, url, { background = false } = {}) {
     const s = this._need(profileId);
     // open blank first → wait for attach+overrides → then navigate (stealth guaranteed pre-script)
-    const { targetId } = await s.cdp.send('Target.createTarget', { url: 'about:blank' });
+    const { targetId } = await s.cdp.send('Target.createTarget', { url: 'about:blank', background });
     const t0 = Date.now();
     while (Date.now() - t0 < 6000) {
       const t = s.targets.get(targetId);
       if (t && t.ready) { try { await s.cdp.send('Page.navigate', { url: normalizeUrl(url) }, t.sessionId); } catch (e) { } break; }
       await sleep(150);
     }
-    // follow the new tab: input routing, screencast and the active-tab highlight must move to it,
-    // otherwise clicks keep landing in (and the stream keeps showing) the previous tab.
-    s.firstTargetId = targetId;
-    await s.cdp.send('Target.activateTarget', { targetId }).catch(() => { });
+    // Only foreground tabs take over input routing, screencast and the active-tab highlight.
+    if (!background) {
+      s.firstTargetId = targetId;
+      await s.cdp.send('Target.activateTarget', { targetId }).catch(() => { });
+    }
     this._broadcastTargets(s);
-    if (s.screencastOn) { try { await this.stopLive(profileId); } catch (e) { } this.startLive(profileId, { fps: this.global.liveFps || 6 }).catch(() => { }); }
+    if (!background && s.screencastOn) { try { await this.stopLive(profileId); } catch (e) { } this.startLive(profileId, { fps: this.global.liveFps || 6 }).catch(() => { }); }
     return targetId;
   }
   async closeTab(profileId, targetId) {
