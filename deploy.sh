@@ -139,6 +139,7 @@ Actions:
   -u, --update           update the detected installation (auto-discovery)
   -U, --uninstall        stop & remove the service, unit, vhost (keeps data)
   -s, --status           show what was detected, where, and from which source
+  -d, --doctor           status + pre-flight diagnostics (no changes made)
   -m, --menu             interactive menu (default when run in a terminal)
   -h, --help             this help
 
@@ -151,6 +152,8 @@ Options:
       --repo URL         git repository used by install/update
       --no-hosts         do not touch /etc/hosts
       --fast             skip the (slow) filesystem walk during discovery
+      --skip-smoke       do not test-launch the new release before applying it
+      --offline          do not touch the network (no git fetch/ls-remote)
       --force            install even if an existing tree was detected
       --purge-data       uninstall also deletes profile data (no backup kept)
   -y, --yes              assume "yes" for confirmations (non-interactive)
@@ -278,9 +281,24 @@ unit_field() { # FILE KEY
 }
 
 unit_exec_dir() { # extract APP_DIR from ExecStart=…/src/index.js
-    local f="$1" line p
+    local f="$1" line p=""
     line="$(unit_field "$f" ExecStart)"
-    p="$(printf '%s\n' "$line" | grep -oE '/[^[:space:]"]*/src/index\.js' | tail -n1 || true)"
+    [[ -n "$line" ]] || return 0
+    line="${line#-}"                        # optional '-' prefix (ignore-failure)
+    # 1) quoted path — unambiguous: ExecStart=/usr/bin/node "/opt/my mirage/src/index.js"
+    p="$(printf '%s\n' "$line" | grep -oE '"[^"]*src/index\.js"' | tail -n1 | tr -d '"' || true)"
+    if [[ -z "$p" ]]; then
+        # 2) backslash-escaped spaces: mask them so the path survives word splitting
+        p="$(printf '%s\n' "$line" \
+             | sed 's/\\ /@@SP@@/g' \
+             | tr ' ' '\n' \
+             | grep -E '/src/index\.js"?$' | tail -n1 | tr -d '"' || true)"
+        p="${p//@@SP@@/ }"
+    fi
+    # 3) plain absolute path without spaces
+    if [[ -z "$p" ]]; then
+        p="$(printf '%s\n' "$line" | grep -oE '/[^[:space:]"]*/src/index\.js' | tail -n1 || true)"
+    fi
     [[ -n "$p" ]] && dirname "$(dirname "$p")"
     return 0
 }
@@ -757,16 +775,9 @@ service_start() {
 }
 
 health_check() { # [PORT] [TRIES]
-    local port="${1:-$PORT}" tries="${2:-12}" i code
+    local port="${1:-$PORT}" tries="${2:-12}" i
     for (( i=1; i<=tries; i++ )); do
-        if have curl; then
-            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$port/" 2>/dev/null || true)"
-            [[ "$code" =~ ^[1-5][0-9][0-9]$ ]] && return 0
-        elif have ss; then
-            ss -ltn 2>/dev/null | grep -qE "[:.]$port[[:space:]]" && return 0
-        else
-            (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
-        fi
+        port_answers "$port" && return 0
         sleep 1
     done
     return 1
@@ -981,14 +992,18 @@ apply_payload() {
             br="$(git -C "$APP_DIR" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
         fi
         [[ -n "$br" && "$br" != "HEAD" ]] || br="${REPO_BRANCH:-main}"
-        if git -C "$APP_DIR" pull --ff-only origin "$br" >/dev/null 2>&1; then
+        local pull_out
+        if pull_out="$(git -C "$APP_DIR" pull --ff-only origin "$br" 2>&1)"; then
             ok "pulled origin/$br"
             return 0
         fi
-        warn "git pull --ff-only failed on branch '$br'"
+        warn "git pull --ff-only failed on branch '$br':"
+        printf '%s\n' "$pull_out" | sed 's/^/      /'
         if [[ "${MIRAGE_HARD_RESET:-0}" == 1 ]]; then
-            warn "MIRAGE_HARD_RESET=1 → git reset --hard origin/$br"
-            git -C "$APP_DIR" reset --hard "origin/$br" && return 0
+            warn "MIRAGE_HARD_RESET=1 → git reset --hard origin/$br (local changes are discarded)"
+            git -C "$APP_DIR" reset --hard "origin/$br" >/dev/null && return 0
+        else
+            say "hint: commit/stash your local changes, or re-run with MIRAGE_HARD_RESET=1 to discard them"
         fi
         return 1
     fi
@@ -1009,6 +1024,377 @@ apply_payload() {
         return 1
     fi
     copy_local_tree
+}
+
+
+# =============================================================================
+#  Pre-flight diagnostics — verify we have everything a safe update needs
+# =============================================================================
+CHECKS_FAIL=0
+CHECKS_WARN=0
+GIT_BRANCH=""
+GIT_BEHIND=0
+GIT_AHEAD=0
+PREFLIGHT_FETCHED=0
+STAGE_DIR=""
+STAGE_REF=""
+SMOKE_LOG=""
+SKIP_SMOKE="${MIRAGE_SKIP_SMOKE:-0}"
+OFFLINE="${MIRAGE_OFFLINE:-0}"
+
+chk_pass() { printf '  %s\xe2\x9c\x93%s %s\n' "$C_GREEN" "$C_OFF" "$*"; }
+chk_warn() { CHECKS_WARN=$((CHECKS_WARN + 1)); printf '  %s!%s %s\n' "$C_YELLOW" "$C_OFF" "$*"; }
+chk_fail() { CHECKS_FAIL=$((CHECKS_FAIL + 1)); printf '  %s\xe2\x9c\x97%s %s\n' "$C_RED" "$C_OFF" "$*"; }
+chk_info() { printf '  %s\xc2\xb7%s %s\n' "$C_DIM" "$C_OFF" "$*"; }
+
+# is anything answering HTTP on PORT?
+port_answers() { # PORT
+    local port="${1:-}" code
+    [[ -n "$port" ]] || return 1
+    if have curl; then
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$port/" 2>/dev/null || true)"
+        [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]
+    else
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null
+    fi
+}
+
+free_port() { # ask node for a port nobody is using
+    local n="${NODE_BIN:-node}" p=""
+    if have "$n"; then
+        p="$("$n" -e 'const net=require("net");const s=net.createServer();s.listen(0,"127.0.0.1",()=>{const a=s.address().port;s.close(()=>console.log(a))})' 2>/dev/null | tr -dc '0-9' || true)"
+    fi
+    if [[ -z "$p" ]]; then
+        p="$((20000 + RANDOM % 20000))"
+        while have ss && ss -ltn 2>/dev/null | grep -qE "[:.]$p[[:space:]]"; do p="$((p + 1))"; done
+    fi
+    printf '%s' "$p"
+}
+
+# Prints every JS file of DIR that does not even parse. Returns 1 when broken.
+syntax_check_tree() { # DIR
+    local d="${1%/}" f n="${NODE_BIN:-}"
+    [[ -n "$n" && -x "$n" ]] || n="$(command -v node 2>/dev/null || true)"
+    [[ -n "$n" ]] || { warn "node is not available for the syntax check"; return 0; }
+    local bad=0
+    while IFS= read -r f; do
+        if ! "$n" --check "$f" >/dev/null 2>&1; then
+            printf '%s\n' "${f#"$d"/}"
+            bad=1
+        fi
+    done < <(find "$d" \( -name node_modules -o -name .git -o -name data -o -name .smoke-data \) -prune -o \
+                -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \) -print 2>/dev/null)
+    return $bad
+}
+
+# Boots DIR on a spare port with a throwaway data dir: proves the release works
+# before we touch the running installation.
+smoke_boot() { # DIR
+    local d="${1%/}" port log data pid i ok=0
+    [[ -f "$d/src/index.js" ]] || { SMOKE_LOG="src/index.js is missing"; return 1; }
+    SMOKE_LOG=""
+    data="$(mktemp -d)"; log="$(mktemp)"; port="$(free_port)"
+    ( cd "$d" || exit 1
+      exec env HOST=127.0.0.1 PORT="$port" MIRAGE_DATA="$data" NODE_ENV=production \
+           "$NODE_BIN" src/index.js >"$log" 2>&1 ) &
+    pid=$!
+    for (( i=1; i<=12; i++ )); do
+        sleep 1
+        if port_answers "$port"; then ok=1; break; fi
+        if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    done
+    kill "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 0.3; done
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    (( ok )) || SMOKE_LOG="$(tail -n 12 "$log" 2>/dev/null || true)"
+    rm -rf "$data" "$log"
+    (( ok ))
+}
+
+# Fetches the candidate release into a temp dir (or points at the local tree).
+prepare_payload() {
+    cleanup_stage
+    local tmp
+    if [[ -d "$APP_DIR/.git" && -n "$GIT_BRANCH" ]]; then
+        if [[ "$OFFLINE" != 1 && "$PREFLIGHT_FETCHED" != 1 ]]; then
+            say "fetching origin/$GIT_BRANCH…"
+            git -C "$APP_DIR" fetch --all --prune >/dev/null 2>&1 || warn "git fetch failed — validating the refs known locally"
+        fi
+        tmp="$(mktemp -d)"
+        if git -C "$APP_DIR" archive "origin/$GIT_BRANCH" 2>/dev/null | tar -x -C "$tmp" 2>/dev/null; then
+            STAGE_DIR="$tmp"; STAGE_REF="origin/$GIT_BRANCH"
+            return 0
+        fi
+        rm -rf "$tmp"
+        warn "cannot snapshot origin/$GIT_BRANCH for validation"
+        return 1
+    fi
+    if [[ -n "$REPO" ]]; then
+        tmp="$(mktemp -d)"
+        say "fetching $REPO for validation…"
+        if git clone --quiet --depth 1 "$REPO" "$tmp" >/dev/null 2>&1; then
+            STAGE_DIR="$tmp"; STAGE_REF="$REPO"
+            return 0
+        fi
+        rm -rf "$tmp"
+        warn "cannot clone $REPO for validation"
+        return 1
+    fi
+    if is_mirage_dir "$SELF_DIR"; then
+        STAGE_DIR="${SELF_DIR%/}"; STAGE_REF="local tree $SELF_DIR"
+        return 0
+    fi
+    warn "no payload to validate (this script is not inside a Mirage tree — set REPO)"
+    return 1
+}
+
+cleanup_stage() {
+    [[ -n "$STAGE_DIR" && "$STAGE_DIR" != "$SELF_DIR" && "$STAGE_DIR" != "$APP_DIR" ]] && rm -rf "$STAGE_DIR" 2>/dev/null
+    STAGE_DIR=""
+    return 0
+}
+
+# Everything that must hold for the new release, verified off-line and off-path:
+# parses, has an entry point, and actually boots on a spare port.
+validate_payload() { # DIR
+    local d="${1%/}" ver
+    if [[ ! -f "$d/package.json" ]]; then chk_fail "release has no package.json"; return 1; fi
+    ver="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$d/package.json" 2>/dev/null | head -n1 || true)"
+    grep -qE '"name"[[:space:]]*:[[:space:]]*"mirage"' "$d/package.json" 2>/dev/null \
+        && chk_pass "release payload: mirage ${ver:-?} ($STAGE_REF)" \
+        || chk_warn "release package.json is not named 'mirage' — continuing ($STAGE_REF)"
+    [[ -f "$d/src/index.js" ]] || { chk_fail "release has no src/index.js"; return 1; }
+    chk_pass "entry point src/index.js present"
+
+    local -a broken=()
+    while IFS= read -r f; do [[ -n "$f" ]] && broken+=("$f"); done < <(syntax_check_tree "$d" || true)
+    if (( ${#broken[@]} )); then
+        chk_fail "release does not parse — ${#broken[@]} broken file(s): ${broken[*]}"
+        return 1
+    fi
+    chk_pass "all JS files parse cleanly"
+
+    if [[ "$SKIP_SMOKE" == 1 ]]; then
+        chk_info "smoke launch skipped (--skip-smoke)"
+        return 0
+    fi
+    say "test-launching the new release on a spare port…"
+    if smoke_boot "$d"; then
+        chk_pass "release boots and answers HTTP"
+        return 0
+    fi
+    chk_fail "release fails to boot:"
+    [[ -n "$SMOKE_LOG" ]] && printf '%s\n' "$SMOKE_LOG" | sed 's/^/      /'
+    return 1
+}
+
+# Why did the service not come up? Show the logs (and name broken files).
+dump_start_failure() {
+    local unit="${SERVICE_NAME%.service}" l shown=0 f
+    if systemd_available && unit_known; then
+        say "last lines of journalctl -u $unit:"
+        journalctl -u "$unit" -n 12 --no-pager 2>/dev/null | sed 's/^/    /' && shown=1
+    fi
+    for l in "$STATE_DIR/mirage.log" "$APP_DIR/mirage.log"; do
+        [[ -f "$l" ]] || continue
+        say "tail of $l:"
+        tail -n 12 "$l" 2>/dev/null | sed 's/^/    /'
+        shown=1
+    done
+    local -a broken=()
+    while IFS= read -r f; do [[ -n "$f" ]] && broken+=("$f"); done < <(syntax_check_tree "$APP_DIR" || true)
+    if (( ${#broken[@]} )); then
+        err "installed tree has syntax errors in: ${broken[*]}"
+        return 0
+    fi
+    if [[ "$shown" == 0 && -n "$NODE_BIN" ]]; then
+        say "direct start attempt:"
+        local out
+        out="$("$NODE_BIN" --check "$APP_DIR/src/index.js" 2>&1 | head -n 6 || true)"
+        [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/    /'
+    fi
+    return 0
+}
+
+# Pre-flight: checks every fact the update relies on, before anything is stopped.
+preflight_update() {
+    CHECKS_FAIL=0; CHECKS_WARN=0
+    say "Pre-flight checks (nothing has been changed yet)…"
+
+    # --- installation tree ---
+    if is_mirage_dir "$APP_DIR"; then chk_pass "app dir: $APP_DIR"
+    else chk_fail "app dir $APP_DIR does not look like a Mirage tree"; fi
+    [[ -f "$APP_DIR/package.json" ]] && chk_pass "package.json present" || chk_fail "package.json is missing"
+    if [[ -w "$APP_DIR" ]]; then chk_pass "app dir is writable"
+    else chk_fail "app dir is not writable by the current user"; fi
+
+    # --- service user ---
+    if id "$APP_USER" >/dev/null 2>&1; then
+        chk_pass "service user '$APP_USER' exists"
+        local owner perms
+        owner="$(stat -c %U "$APP_DIR" 2>/dev/null || true)"
+        perms="$(stat -c %a "$APP_DIR" 2>/dev/null || true)"
+        if [[ "$owner" == "$APP_USER" || "${perms:2:1}" =~ [rx] ]]; then
+            chk_pass "service user can access the tree (owner ${owner:-?}, mode ${perms:-?})"
+        else
+            chk_warn "tree owner is ${owner:-?} (mode ${perms:-?}) — '$APP_USER' may not be able to read it"
+        fi
+    else
+        chk_warn "service user '$APP_USER' does not exist on this machine"
+    fi
+
+    # --- runtimes ---
+    if [[ -n "$NODE_BIN" ]] && node_ok "$NODE_BIN"; then
+        chk_pass "node $("$NODE_BIN" -v 2>/dev/null) at $NODE_BIN"
+    elif [[ -n "$NODE_BIN" ]]; then
+        chk_fail "node at $NODE_BIN is older than 22.5 — Mirage needs node:sqlite"
+    else
+        chk_fail "node binary not found — set NODE_BIN=/path/to/node"
+    fi
+    local unit_node
+    unit_node="$(unit_exec_node "${SERVICE_UNIT:-}")"
+    if [[ -n "$unit_node" && -n "$NODE_BIN" && "$unit_node" != "$NODE_BIN" ]]; then
+        chk_warn "the unit starts $unit_node, the checks used $NODE_BIN"
+    fi
+    if [[ -n "$CHROME" ]]; then chk_pass "chromium: $CHROME"
+    else chk_warn "chromium not found — set CHROME_BIN=… or profiles will not launch"; fi
+    have git || chk_warn "git is not installed"
+    have rsync || chk_info "rsync not installed — falling back to cp for the payload sync"
+
+    # --- systemd unit ---
+    if [[ -n "$SERVICE_UNIT" ]]; then
+        chk_pass "systemd unit: $SERVICE_UNIT"
+        local wd es
+        wd="$(unit_field "$SERVICE_UNIT" WorkingDirectory)"; wd="${wd%\"}"; wd="${wd#\"}"
+        if [[ -z "$wd" || "${wd%/}" == "$APP_DIR" ]]; then chk_pass "unit WorkingDirectory matches the app dir"
+        else chk_fail "unit WorkingDirectory is '$wd' but the app dir is '$APP_DIR'"; fi
+        es="$(unit_exec_dir "$SERVICE_UNIT")"
+        if [[ -z "$es" || "$es" == "$APP_DIR" ]]; then chk_pass "unit ExecStart points into the app dir"
+        else chk_fail "unit ExecStart points at '$es' instead of '$APP_DIR'"; fi
+        if systemd_available; then
+            case "$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)" in
+                enabled) chk_pass "unit is enabled" ;;
+                masked)  chk_fail "unit is masked — unmask it: systemctl unmask $SERVICE_NAME" ;;
+                *)       chk_warn "unit is not enabled (it will not come back after a reboot)" ;;
+            esac
+        else
+            chk_warn "systemd is not running — the update will use the background-process fallback"
+        fi
+    else
+        chk_warn "no systemd unit found for $APP_DIR (will use the fallback start)"
+    fi
+
+    # --- port / service state ---
+    if service_active; then chk_pass "service is currently active"
+    else chk_warn "service is not active — the update will start it afterwards"; fi
+    if have ss && [[ -n "$PORT" ]] && ss -ltn 2>/dev/null | grep -qE "[:.]$PORT[[:space:]]"; then
+        if service_active; then chk_pass "port $PORT is held by this service"
+        else chk_warn "port $PORT is already in use by another process — the service may fail to bind"; fi
+    fi
+
+    # --- data dir & disk space ---
+    if [[ -d "$DATA_DIR" ]]; then
+        chk_pass "data dir: $DATA_DIR"
+        if [[ -w "$DATA_DIR" ]]; then chk_pass "data dir is writable"
+        else chk_fail "data dir $DATA_DIR is not writable"; fi
+    else
+        chk_info "data dir $DATA_DIR does not exist yet (created on first run)"
+    fi
+    local broot need avail
+    broot="${BACKUP_ROOT:-$(dirname "$APP_DIR")}"
+    need="$(du -sk "$APP_DIR" 2>/dev/null | awk '{print $1+0}')"
+    avail="$(df -Pk "$broot" 2>/dev/null | awk 'NR==2{print $4+0}')"
+    if (( need > 0 && avail > 0 )); then
+        if (( avail < need + 51200 )); then
+            chk_warn "little free space in $broot: $((avail / 1024))MB free, the backup needs ~$((need / 1024))MB"
+        else
+            chk_pass "free space for the backup: $((avail / 1024))MB in $broot"
+        fi
+    fi
+
+    # --- nginx ---
+    if [[ -n "$NGINX_CONF" ]]; then
+        if have nginx && nginx -t >/dev/null 2>&1; then chk_pass "nginx config is valid ($NGINX_CONF)"
+        else chk_warn "nginx config test failed — the vhost will not be reloaded"; fi
+    fi
+
+    # --- payload source / git state ---
+    GIT_BRANCH=""; GIT_BEHIND=0; GIT_AHEAD=0
+    if [[ -d "$APP_DIR/.git" ]]; then
+        if have git; then
+            chk_pass "installation is a git checkout"
+            GIT_BRANCH="$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+            if [[ "$GIT_BRANCH" == "HEAD" ]]; then
+                GIT_BRANCH="$(git -C "$APP_DIR" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
+                [[ -n "$GIT_BRANCH" ]] || GIT_BRANCH="${REPO_BRANCH:-main}"
+                chk_warn "HEAD is detached — assuming branch '$GIT_BRANCH'"
+            fi
+            if git -C "$APP_DIR" remote get-url origin >/dev/null 2>&1; then
+                chk_pass "origin: $(git -C "$APP_DIR" remote get-url origin)"
+            elif [[ -n "$REPO" ]]; then
+                chk_warn "no 'origin' remote — falling back to REPO=$REPO"
+            else
+                chk_fail "no 'origin' remote and REPO is not set — there is nothing to pull from"
+            fi
+            PREFLIGHT_FETCHED=0
+            if [[ "$OFFLINE" != 1 ]]; then
+                if git -C "$APP_DIR" ls-remote --exit-code origin >/dev/null 2>&1; then
+                    chk_pass "git remote is reachable"
+                    if git -C "$APP_DIR" fetch --all --prune >/dev/null 2>&1; then
+                        PREFLIGHT_FETCHED=1
+                        chk_pass "fetched the latest refs"
+                    else
+                        chk_warn "git fetch failed — working with the refs known locally"
+                    fi
+                else
+                    chk_fail "cannot reach the git remote (offline? credentials?) — fix it or re-run with --offline to update from the local tree"
+                fi
+            else
+                chk_info "offline mode: no ls-remote/fetch, using the refs known locally"
+            fi
+            local dirty
+            dirty="$(git -C "$APP_DIR" status --porcelain 2>/dev/null | head -n 5 || true)"
+            if [[ -n "$dirty" ]]; then
+                chk_warn "local changes in the tree — a fast-forward pull may refuse:"
+                printf '%s\n' "$dirty" | sed 's/^/      /'
+            else
+                chk_pass "working tree is clean"
+            fi
+            if git -C "$APP_DIR" rev-parse --verify --quiet "origin/$GIT_BRANCH" >/dev/null 2>&1; then
+                GIT_BEHIND="$(git -C "$APP_DIR" rev-list --count "HEAD..origin/$GIT_BRANCH" 2>/dev/null || echo 0)"
+                GIT_AHEAD="$(git -C "$APP_DIR" rev-list --count "origin/$GIT_BRANCH..HEAD" 2>/dev/null || echo 0)"
+                if (( GIT_BEHIND > 0 )); then chk_pass "$GIT_BEHIND commit(s) to pull from origin/$GIT_BRANCH"
+                else chk_info "already at origin/$GIT_BRANCH"; fi
+                if (( GIT_AHEAD > 0 )); then
+                    chk_fail "the checkout is $GIT_AHEAD commit(s) ahead of origin/$GIT_BRANCH — 'pull --ff-only' cannot fast-forward (commit/stash them, or re-run with MIRAGE_HARD_RESET=1 to discard)"
+                fi
+            else
+                chk_warn "origin/$GIT_BRANCH is not known locally yet"
+            fi
+        else
+            chk_fail "the installation is a git checkout but git is not installed"
+        fi
+    elif [[ -n "$REPO" ]]; then
+        chk_pass "payload source: REPO=$REPO"
+        have git || chk_fail "git is required to fetch REPO"
+    elif is_mirage_dir "$SELF_DIR"; then
+        chk_pass "payload source: this tree ($SELF_DIR)"
+    else
+        chk_fail "no payload source: this script is not inside a Mirage tree — set REPO=<git url>"
+    fi
+
+    echo ""
+    if (( CHECKS_FAIL )); then
+        err "pre-flight: $CHECKS_FAIL problem(s), $CHECKS_WARN warning(s)"
+        return 1
+    fi
+    if (( CHECKS_WARN )); then
+        warn "pre-flight: all required checks passed, $CHECKS_WARN warning(s) above"
+    else
+        ok "pre-flight: everything the update needs is in place"
+    fi
+    return 0
 }
 
 # =============================================================================
@@ -1256,6 +1642,41 @@ do_update() {
     dim "  detected via: $DISCOVERY_SOURCE"
     print_discovery_report
 
+    # ---- 1. diagnostics: is everything the update needs really there? -------
+    if ! preflight_update; then
+        if [[ "$FORCE" == 1 ]]; then
+            warn "--force: continuing despite the failed checks"
+        else
+            err "nothing was changed — the running version is untouched."
+            say "fix the items marked ✗ above and re-run:  sudo ./deploy.sh --update"
+            say "(or re-run with --force to ignore them, --skip-smoke to skip the release launch test)"
+            return 1
+        fi
+    fi
+
+    # ---- 2. validate the candidate release BEFORE touching the service ------
+    say "Loading and validating the new release…"
+    if ! prepare_payload; then
+        err "could not obtain the new release — nothing was changed."
+        return 1
+    fi
+    if ! validate_payload "$STAGE_DIR"; then
+        err "the new release was rejected — nothing was changed, the old version keeps running."
+        say "release source: $STAGE_REF"
+        say "publish a fixed build and re-run:  sudo ./deploy.sh --update"
+        cleanup_stage
+        return 1
+    fi
+    if [[ "$STAGE_REF" == origin/* && "$GIT_BEHIND" == 0 && "$FORCE" != 1 ]]; then
+        ok "already at $STAGE_REF — there is nothing to pull, the installed version is the latest."
+        dim "  (use --force to re-apply the tree and restart the service anyway)"
+        cleanup_stage
+        return 0
+    fi
+    cleanup_stage
+
+    # ---- 3. swap: stop, back up, apply, start -------------------------------
+    say "Plan: apply $STAGE_REF → $APP_DIR, back up to ${BACKUP_ROOT:-$(dirname "$APP_DIR")}, restart $SERVICE_NAME (port $PORT)"
     local was_active=0
     if service_active; then
         was_active=1
@@ -1267,11 +1688,12 @@ do_update() {
     make_backup
 
     if ! apply_payload; then
-        err "failed to fetch the new version"
+        err "failed to apply the new version"
         if [[ -n "$BACKUP_DIR" ]]; then
-            say "the tree is untouched; backup is at $BACKUP_DIR"
+            say "tree state is unchanged; backup is at $BACKUP_DIR"
         fi
         if (( was_active )); then service_start; fi
+        _post_failure_health
         return 1
     fi
 
@@ -1290,6 +1712,7 @@ do_update() {
     fi
 
     err "Mirage did not come up after the update."
+    dump_start_failure
     if [[ -n "$BACKUP_DIR" ]]; then
         warn "rolling back from $BACKUP_DIR…"
         service_stop
@@ -1300,13 +1723,40 @@ do_update() {
         service_start
         if health_check "$PORT" 15; then
             ok "rolled back — the previous version is running again."
+            say "nothing was lost; the failed release was NOT applied."
         else
-            err "rollback done but the app still does not answer — check: journalctl -u ${SERVICE_NAME%.service} -n 50"
+            err "rollback done but the app still does not answer."
+            dump_start_failure
         fi
     else
         warn "no backup was available for rollback."
     fi
     return 1
+}
+
+# After a failed start outside the rollback path: report whether the service is up.
+_post_failure_health() {
+    if health_check "$PORT" 5; then
+        ok "the previous version is still serving on port $PORT."
+    else
+        err "the service is not answering on port $PORT."
+        dump_start_failure
+    fi
+    return 0
+}
+
+do_doctor() {
+    resolve_installation
+    do_status || true
+    echo ""
+    preflight_update || true
+    echo ""
+    if (( CHECKS_FAIL )); then
+        err "diagnostics: $CHECKS_FAIL problem(s) must be fixed before an update."
+        return 1
+    fi
+    ok "diagnostics: the machine is ready for install/update."
+    return 0
 }
 
 do_uninstall() {
@@ -1436,7 +1886,7 @@ show_menu() {
     echo "  1) Install Mirage"
     echo "  2) Update Mirage"
     echo "  3) Uninstall Mirage"
-    echo "  4) Status / diagnostics"
+    echo "  4) Status / diagnostics (pre-flight)"
     echo "  5) Exit"
     echo "------------------------------------------"
     printf '  detected: %s\n' "$detected"
@@ -1457,7 +1907,7 @@ menu_loop() {
             1) do_install || true ;;
             2) do_update || true ;;
             3) do_uninstall || true ;;
-            4) do_status || true ;;
+            4) do_doctor || true ;;
             5) say "Exiting…"; return 0 ;;
             *) warn "Invalid option. Please select 1-5." ;;
         esac
@@ -1474,12 +1924,15 @@ main() {
             -i|--install)   action=install ;;
             -u|--update)    action=update ;;
             -U|--uninstall|--remove) action=uninstall ;;
-            -s|--status|--doctor|--find|--diagnose) action=status ;;
+            -s|--status|--find) action=status ;;
+            -d|--doctor|--preflight|--diagnose) action=doctor ;;
             -m|--menu)      action=menu ;;
             -y|--yes|--assume-yes) MIRAGE_ASSUME_YES=1 ;;
             --purge-data)   PURGE_DATA=1 ;;
             --force)        FORCE=1 ;;
             --fast|--no-fs-scan) MIRAGE_NO_FS_SCAN=1 ;;
+            --skip-smoke|--no-smoke) SKIP_SMOKE=1 ;;
+            --offline) OFFLINE=1 ;;
             --no-hosts)     SET_HOSTS=0 ;;
             --no-sudo)      MIRAGE_NO_SUDO=1 ;;
             --app-dir|--dir|--path)
@@ -1502,6 +1955,9 @@ main() {
     case "$action" in
         status)
             do_status || true
+            ;;
+        doctor)
+            do_doctor || true
             ;;
         install|update|uninstall)
             ensure_root

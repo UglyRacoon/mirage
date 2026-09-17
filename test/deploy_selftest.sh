@@ -137,6 +137,25 @@ check "port from unit"   "8899"    "$PORT"
 check "node from unit"   "/usr/local/bin/node" "$NODE_BIN"
 check "domain falls back to default" "$DEFAULT_DOMAIN" "$DOMAIN"
 
+echo "== unit parsing (renamed units, odd paths) =="
+mkdir -p "$TMP/units"
+python3 - "$TMP/units" <<'PY'
+import sys, os
+d = sys.argv[1]
+open(os.path.join(d, "quoted.service"), "w").write(
+    '[Service]\nExecStart=/usr/bin/node "/opt/my mirage/src/index.js"\nWorkingDirectory="/opt/my mirage"\n')
+open(os.path.join(d, "escaped.service"), "w").write(
+    '[Service]\nExecStart=/usr/bin/node /opt/my\\ mirage/src/index.js\n')
+open(os.path.join(d, "cyrillic.service"), "w").write(
+    '[Service]\nExecStart=/usr/local/bin/node /home/pluton/\u0414\u043e\u043a\u0443\u043c\u0435\u043d\u0442\u044b/mirage/src/index.js\nUser=pluton\n')
+PY
+check "quoted ExecStart path"     "/opt/my mirage"               "$(unit_exec_dir "$TMP/units/quoted.service")"
+check "escaped-space ExecStart"   "/opt/my mirage"               "$(unit_exec_dir "$TMP/units/escaped.service")"
+check "cyrillic ExecStart path"   "/home/pluton/Документы/mirage" "$(unit_exec_dir "$TMP/units/cyrillic.service")"
+check "quoted WorkingDirectory"   "/opt/my mirage"               "$(unit_field "$TMP/units/quoted.service" WorkingDirectory | tr -d '"')"
+check "user from such a unit"     "pluton"                       "$(unit_field "$TMP/units/cyrillic.service" User)"
+rm -f "$TMP/units/quoted.service" "$TMP/units/escaped.service" "$TMP/units/cyrillic.service"
+
 echo "== discovery: scan finds a renamed unit =="
 reset_env
 cat >"$TMP/units/gateway.service" <<EOF
@@ -267,6 +286,14 @@ out="$(bash "$DEPLOY" --find 2>&1 || true)"
 [[ "$out" == *"installation found"* ]] && pass "--find alias works" || fail "--find alias broken"
 out="$(MIRAGE_NO_SUDO=1 bash "$DEPLOY" --uninstall 2>&1 || true)"
 [[ "$out" == *"root is required"* ]] && pass "uninstall needs root (guarded)" || fail "uninstall root guard missing"
+out="$(MIRAGE_SEARCH_ROOTS="$TMP" MIRAGE_STATE_FILE="$MOCK_STATE" MIRAGE_UNIT_DIRS="$TMP/units" \
+       bash "$DEPLOY" --doctor 2>&1 || true)"
+if [[ "$out" == *"diagnostics"* ]]; then pass "--doctor runs the pre-flight"; else fail "--doctor produced no diagnostics"; fi
+if [[ "$out" == *"pre-flight"* ]]; then pass "--doctor prints the checklist"; else fail "--doctor checklist missing"; fi
+if [[ "$out" == *"root is required"* ]]; then fail "--doctor demands root (it must not)"; else pass "--doctor works unprivileged"; fi
+for flag in --skip-smoke --offline --force --purge-data --no-hosts; do
+    if bash "$DEPLOY" --help 2>&1 | grep -q -- "$flag"; then pass "$flag documented"; else fail "$flag missing from --help"; fi
+done
 
 echo "== non-root guard =="
 out="$(MIRAGE_NO_SUDO=1 bash "$DEPLOY" --update 2>&1 || true)"

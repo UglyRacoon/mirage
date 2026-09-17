@@ -79,7 +79,8 @@ sudo ./deploy.sh                 # меню
 sudo ./deploy.sh --install       # установка / починка
 sudo ./deploy.sh --update        # обновление (где бы ни лежала установка)
 sudo ./deploy.sh --uninstall     # удаление (данные профилей сохраняются)
-sudo ./deploy.sh --status        # диагностика: что и как найдено
+sudo ./deploy.sh --status        # что и как найдено
+sudo ./deploy.sh --doctor        # расширенная диагностика + pre-flight (ничего не меняет)
 ```
 Меню: `1) Install · 2) Update · 3) Uninstall · 4) Status · 5) Exit`; в заголовке сразу видно,
 **какая установка обнаружена**.
@@ -115,6 +116,56 @@ Chromium, каталог данных и nginx-vhost. Установка рас�
 Работает и без systemd (контейнеры/WSL): сервис поднимается фоновым процессом с pid-файлом в
 `/etc/mirage/mirage.pid`, вывод — в `/etc/mirage/mirage.log`; nginx не обязателен.
 
+#### Диагностика перед обновлением (pre-flight)
+Перед любым изменением `Update` прогоняет проверки и **ничего не меняет, пока они не пройдены**
+(нулевой простой при неудаче):
+
+```
+[mirage] Pre-flight checks (nothing has been changed yet)…
+  ✓ app dir: /home/pluton/Документы/mirage
+  ✓ package.json present
+  ✓ app dir is writable
+  ✓ service user 'pluton' exists
+  ✓ service user can access the tree (owner pluton, mode 755)
+  ✓ node v22.7.0 at /usr/bin/node
+  ✓ chromium: /usr/bin/chromium
+  ✓ systemd unit: /etc/systemd/system/mirage.service
+  ✓ unit WorkingDirectory matches the app dir
+  ✓ unit ExecStart points into the app dir
+  ✓ unit is enabled
+  ✓ service is currently active
+  ✓ port 7788 is held by this service
+  ✓ data dir: …/data + writable
+  ✓ free space for the backup: 19737MB in /home
+  ✓ nginx config is valid (/etc/nginx/conf.d/mirage.conf)
+  ✓ installation is a git checkout
+  ✓ origin: https://github.com/…/mirage.git
+  ✓ git remote is reachable
+  ✓ fetched the latest refs
+  ✓ working tree is clean
+  ✓ 3 commit(s) to pull from origin/main
+```
+
+Проверяется: само дерево и права, сервисный пользователь, `node` (и совпадает ли он с юнитом),
+Chromium, согласованность юнита (`ExecStart`/`WorkingDirectory`/enabled/masked), занят ли порт и
+активен ли сервис, доступность и место под каталог данных, свободное место под бэкап, `nginx -t`,
+git-состояние (remotes, сеть, грязное дерево, «на сколько коммитов отстали/убежали вперёд»). Каждая
+строка помечена `✓` / `!` (предупреждение) / `✗` (блокер). При `✗` обновление останавливается с
+подсказкой, что именно исправить; `--force` позволяет проигнорировать.
+
+**Дальше проверяется сам релиз, до остановки сервиса:**
+1. payload скачивается в отдельный временный каталог (release ещё не применён);
+2. `node --check` по всем JS-файлам — синтаксическая ошибка в релизе отклоняется с указанием файла;
+3. **тестовый запуск релиза на свободном порту** с временной базой: если новая версия не поднимается и
+   не отвечает по HTTP — обновление отклоняется, старая версия продолжает работать (откат не нужен);
+4. только после этого сервис останавливается, делается бэкап, применяется код и выполняется запуск с
+   финальной проверкой; при неудаче — автоматический откат из бэкапа и вывод логов
+   (`journalctl -u mirage` / `/etc/mirage/mirage.log`), чтобы причина была видна сразу.
+
+Тот же чек-лист доступен вручную: `sudo ./deploy.sh --doctor` (пункт 4 меню) — ничего не меняет,
+только показывает состояние. Флаги: `--skip-smoke` (не запускать тестовый старт релиза),
+`--offline` (не ходить в сеть, работать по локальным ref'ам), `--force` (игнорировать `✗`).
+
 Любое значение можно переопределить флагом или переменной окружения:
 ```bash
 sudo ./deploy.sh --update --app-dir /srv/apps/mirage --port 8080
@@ -126,8 +177,8 @@ sudo ./deploy.sh --update --fast          # не обходить всю ФС п
 
 #### Тесты скрипта
 ```bash
-bash test/deploy_selftest.sh   # 60 проверок поиска/распознавания (без root)
-bash test/deploy_e2e.sh        # 30 проверок: update, бэкап, откат, перенос установки (без root)
+bash test/deploy_selftest.sh   # 73 проверки поиска/распознавания (без root)
+bash test/deploy_e2e.sh        # 50 проверок: pre-flight, отклонение битого релиза, откат, перенос установки (без root)
 ```
 
 #### Вариант 2: Ручная установка
@@ -387,8 +438,21 @@ unless `--purge-data` is given. On boxes without systemd the service runs as a b
 (pid file + log in `/etc/mirage/`); nginx is optional. After deploy, **change the default PIN in
 Team** and (if remote) front it with TLS + auth.
 
-Both test suites run unprivileged: `bash test/deploy_selftest.sh` (60 discovery checks) and
-`bash test/deploy_e2e.sh` (30 checks: update, backup, rollback, moved install).
+**Pre-flight before every update.** `Update` first runs a full checklist (tree and permissions,
+service user, node/chromium, unit consistency incl. `ExecStart`/`WorkingDirectory`/enabled/masked,
+port and service state, data dir, free space for the backup, `nginx -t`, git remotes/network/dirty
+tree/ahead-behind) and stops at the first ✗ with an actionable hint — nothing is changed, so a failed
+pre-flight costs zero downtime. Then the **candidate release is validated before the service is even
+stopped**: it is fetched into a scratch dir, every JS file is `node --check`ed, and the release is
+**test-launched on a spare port** with a throwaway database. A broken release is rejected with the
+offending file named and the old version keeps serving; only a release that passes is applied, with
+a backup, a final health check and rollback + logs (`journalctl -u mirage`) if the app then fails to
+start. The same checklist is available on demand via `sudo ./deploy.sh --doctor` (menu item 4);
+`--skip-smoke`, `--offline` and `--force` tune the behaviour.
+
+Both test suites run unprivileged: `bash test/deploy_selftest.sh` (73 discovery checks) and
+`bash test/deploy_e2e.sh` (50 checks: pre-flight, broken-release rejection, update, backup, rollback,
+moved install).
 
 > **Do this now:** fresh installs no longer ship a default PIN — a random one is printed to the log
 > once on first run; an *existing* install that still uses the historical PIN `mirage` keeps working

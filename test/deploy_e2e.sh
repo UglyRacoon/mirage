@@ -113,11 +113,13 @@ if apply_payload >/dev/null 2>&1; then pass "payload applied to a non-git tree";
 check "plain tree got the new release" "9.9.9" "$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$plain/package.json" | head -n1)"
 APP_DIR_ENV="$TMP/app"; APP_DIR="$TMP/app"; REPO="$TMP/origin_src"
 
-echo "== 4. rollback when the new version cannot start =="
+echo "== 4. a broken release is refused BEFORE anything is touched =="
 mkdir -p "$TMP/app/data"; echo "profile-data" >"$TMP/app/data/mirage.db"
-# break the payload in a way only a runtime check can catch
+svc_pid="$(bg_pid || true)"
+ver_before="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/app/package.json" | head -n1)"
+# publish a release that cannot even parse
 perl -0pi -e 's/const DATA = process\.env\.MIRAGE_DATA/const DATA = process.env.MIRAGE_DATA; await brokenSyntaxHere(/' "$TMP/origin_src/src/index.js"
-if ! node --check "$TMP/origin_src/src/index.js" >/dev/null 2>&1; then pass "broken payload prepared"; else fail "payload is not broken"; fi
+if ! node --check "$TMP/origin_src/src/index.js" >/dev/null 2>&1; then pass "broken release prepared"; else fail "release is not broken"; fi
 git -C "$TMP/origin_src" add -A && git -C "$TMP/origin_src" commit --quiet -m "broken release"
 
 if do_update >"$TMP/update2.log" 2>&1; then
@@ -125,15 +127,73 @@ if do_update >"$TMP/update2.log" 2>&1; then
 else
     pass "do_update reported failure on a broken payload"
 fi
-if grep -q "did not come up after the update" "$TMP/update2.log"; then
-    pass "health check caught the broken payload"
-else
-    fail "broken payload was not detected: $(tail -3 "$TMP/update2.log")"
-fi
-if grep -q "rolling back" "$TMP/update2.log"; then pass "rollback was attempted"; else fail "no rollback in log: $(tail -6 "$TMP/update2.log")"; fi
-if node --check "$TMP/app/src/index.js" >/dev/null 2>&1; then pass "rolled-back tree is valid again"; else fail "tree left broken after rollback"; fi
+if grep -q "does not parse" "$TMP/update2.log"; then pass "the parse error is named"; else fail "no parse error reported: $(tail -6 "$TMP/update2.log")"; fi
+if grep -qi "rolling back" "$TMP/update2.log"; then fail "a rollback happened — the release should have been refused earlier"; else pass "no rollback needed (install was never touched)"; fi
+check "service was not restarted" "$svc_pid" "$(bg_pid || echo none)"
+check "version on disk is unchanged" "$ver_before" "$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/app/package.json" | head -n1)"
+if wait_health; then pass "old version keeps serving (zero downtime)"; else fail "app went down while refusing the release"; fi
+
+echo "== 4b. rollback path: a release that passes validation but dies on start =="
+# repair the source and publish a good release
+python3 - "$TMP/origin_src/src/index.js" <<'PYFIX'
+import sys
+p = sys.argv[1]
+s = open(p).read().replace("; await brokenSyntaxHere(", "")
+open(p, "w").write(s)
+PYFIX
+if node --check "$TMP/origin_src/src/index.js" >/dev/null 2>&1; then pass "good release prepared"; else fail "could not repair the source tree"; fi
+git -C "$TMP/origin_src" add -A && git -C "$TMP/origin_src" commit --quiet -m "fix: repair release"
+
+# the release itself is fine, but the first health check after the swap fails
+orig_health="$(declare -f health_check)"
+eval "health_check__real${orig_health#health_check}"
+FAIL_HEALTH=1
+health_check() { if (( FAIL_HEALTH > 0 )); then FAIL_HEALTH=$((FAIL_HEALTH - 1)); return 1; fi; health_check__real "$@"; }
+if do_update >"$TMP/update3.log" 2>&1; then fail "update reported success although the service never came up"; else pass "update reported failure"; fi
+eval "$orig_health"
+
+if grep -q "did not come up after the update" "$TMP/update3.log"; then pass "start failure detected"; else fail "no start failure reported: $(tail -6 "$TMP/update3.log")"; fi
+if grep -q "rolling back" "$TMP/update3.log"; then pass "rollback was attempted"; else fail "no rollback: $(tail -8 "$TMP/update3.log")"; fi
+if grep -q "rolled back — the previous version is running again" "$TMP/update3.log"; then pass "rollback brought the old version back"; else fail "rollback did not recover"; fi
+check "rolled back to the previous version" "$ver_before" "$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/app/package.json" | head -n1)"
+if node --check "$TMP/app/src/index.js" >/dev/null 2>&1; then pass "rolled-back tree parses"; else fail "tree left broken after rollback"; fi
 if wait_health; then pass "app is serving after rollback"; else fail "app is down after rollback"; fi
 if grep -q "profile-data" "$TMP/app/data/mirage.db" 2>/dev/null; then pass "profile data survived the rollback"; else fail "profile data lost during rollback"; fi
+
+echo "== 4c. pre-flight: a checkout that is ahead of origin is caught =="
+git -C "$TMP/app" config user.email t@t; git -C "$TMP/app" config user.name t
+echo "local patch" >>"$TMP/app/src/util.js"
+git -C "$TMP/app" add -A && git -C "$TMP/app" commit --quiet -m "local hotfix"
+if do_update >"$TMP/update4.log" 2>&1; then
+    fail "do_update proceeded although it cannot fast-forward"
+else
+    pass "do_update refused an un-fast-forwardable checkout"
+fi
+if grep -q "ahead of origin" "$TMP/update4.log"; then pass "reason mentions commits ahead"; else fail "no 'ahead' hint: $(tail -6 "$TMP/update4.log")"; fi
+git -C "$TMP/app" reset --hard --quiet origin/main
+
+echo "== 4d. pre-flight: a dirty working tree is a warning, not a blocker =="
+python3 - "$TMP/origin_src/package.json" <<'PYVER'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p)); d["version"] = "9.9.10"
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
+PYVER
+git -C "$TMP/origin_src" add -A && git -C "$TMP/origin_src" commit --quiet -m "release 9.9.10"
+echo "scratch" >"$TMP/app/scratch.txt"          # untracked file: a pull still works
+if do_update >"$TMP/update5.log" 2>&1; then pass "update went through with a dirty tree"; else fail "update failed on a dirty tree: $(tail -6 "$TMP/update5.log")"; fi
+if grep -q "local changes in the tree" "$TMP/update5.log"; then pass "dirty tree was reported as a warning"; else fail "dirty tree not mentioned"; fi
+check "new release applied" "9.9.10" "$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/app/package.json" | head -n1)"
+check "the untracked file was kept" "yes" "$([[ -f "$TMP/app/scratch.txt" ]] && echo yes || echo no)"
+rm -f "$TMP/app/scratch.txt"
+if wait_health; then pass "service is serving after the update"; else fail "service is down"; fi
+
+echo "== 4e. pre-flight reports a clean bill of health =="
+APP_DIR_ENV=""; APP_DIR="$TMP/app"
+if preflight_update >"$TMP/preflight.log" 2>&1; then pass "preflight passes on a healthy install"; else fail "preflight failed: $(grep 'x' /dev/null; grep -F '✗' "$TMP/preflight.log" | head -3)"; fi
+if grep -qF '✓' "$TMP/preflight.log"; then pass "checks are reported individually"; else fail "no individual checks printed"; fi
+if grep -q "service user" "$TMP/preflight.log"; then pass "service user is verified"; else fail "service user not checked"; fi
+if grep -q "already at origin" "$TMP/preflight.log"; then pass "up-to-date state is reported"; else fail "up-to-date state not reported"; fi
 
 echo "== 5. surviving a moved installation (path changed) =="
 moved="$TMP/moved/elsewhere"
