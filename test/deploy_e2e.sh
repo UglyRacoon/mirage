@@ -195,6 +195,77 @@ if grep -qF '✓' "$TMP/preflight.log"; then pass "checks are reported individua
 if grep -q "service user" "$TMP/preflight.log"; then pass "service user is verified"; else fail "service user not checked"; fi
 if grep -q "already at origin" "$TMP/preflight.log"; then pass "up-to-date state is reported"; else fail "up-to-date state not reported"; fi
 
+echo "== 4f. field scenario: main is broken, the fix lives on another branch =="
+svc_pid="$(bg_pid || true)"
+# publish the broken release on main
+python3 - "$TMP/origin_src/src/index.js" <<'PYBREAK'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+open(p, "w").write(s.replace("const DATA = process.env.MIRAGE_DATA",
+                             "const DATA = process.env.MIRAGE_DATA; await brokenSyntaxHere("))
+PYBREAK
+git -C "$TMP/origin_src" add -A && git -C "$TMP/origin_src" commit --quiet -m "release 9.9.11 (broken)"
+git -C "$TMP/origin_src" push --quiet origin main 2>/dev/null || true
+
+APP_DIR_ENV=""; APP_DIR="$TMP/app"; BRANCH_ENV=""
+if do_update >"$TMP/update6.log" 2>&1; then fail "broken main was accepted"; else pass "update from the broken main is refused"; fi
+if grep -q "brokenSyntaxHere\|Unexpected reserved word" "$TMP/update6.log"; then
+    pass "the actual syntax error text is shown"
+else
+    fail "syntax error text missing: $(grep -A2 'does not parse' "$TMP/update6.log" | head -4)"
+fi
+if grep -q -- "--branch" "$TMP/update6.log"; then pass "the refusal suggests --branch"; else fail "no --branch hint in the refusal"; fi
+check "service still untouched" "$svc_pid" "$(bg_pid || echo none)"
+if wait_health; then pass "old version still serving after the refusal"; else fail "service went down"; fi
+
+# the fix is published on a side branch (like PR #2)
+git -C "$TMP/origin_src" checkout --quiet -b fix HEAD~1
+python3 - "$TMP/origin_src/package.json" <<'PYVER'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p)); d["version"] = "9.10.0"
+json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
+PYVER
+git -C "$TMP/origin_src" add -A && git -C "$TMP/origin_src" commit --quiet -m "release 9.10.0 (fixed, on branch fix)"
+git -C "$TMP/origin_src" checkout --quiet main
+
+BRANCH_ENV="fix"
+if do_update >"$TMP/update7.log" 2>&1; then pass "update from branch 'fix' succeeded"; else fail "update --branch fix failed: $(tail -8 "$TMP/update7.log")"; fi
+check "checkout switched to the requested branch" "fix" "$(git -C "$TMP/app" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+check "deployed version" "9.10.0" "$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP/app/package.json" | head -n1)"
+check "state file records the ref" "origin/fix" "$(sed -n 's/^MIRAGE_GIT_REF="\(.*\)"$/\1/p' "$MIRAGE_STATE_FILE")"
+if wait_health; then pass "service is serving the branch build"; else fail "service is down"; fi
+if grep -q "switching the checkout" "$TMP/update7.log"; then pass "the branch switch was announced"; else fail "no switch message: $(tail -6 "$TMP/update7.log")"; fi
+
+BRANCH_ENV=""
+if do_update >"$TMP/update8.log" 2>&1; then pass "second run is a no-op on the deployed branch"; else fail "no-op run failed: $(tail -5 "$TMP/update8.log")"; fi
+if grep -q "nothing to pull" "$TMP/update8.log"; then pass "up-to-date state explained"; else fail "no 'nothing to pull' message: $(tail -4 "$TMP/update8.log")"; fi
+
+BRANCH_ENV="does-not-exist"
+if do_update >"$TMP/update9.log" 2>&1; then fail "a bogus branch was accepted"; else pass "a bogus branch is refused"; fi
+if grep -q "was not found" "$TMP/update9.log"; then pass "missing ref is reported"; else fail "no 'not found' message"; fi
+BRANCH_ENV=""
+if wait_health; then pass "service is still serving after all of that"; else fail "service is down"; fi
+
+echo "== 4g. a read-only state dir must not break the background start =="
+mkdir -p "$TMP/ro-state"; chmod 500 "$TMP/ro-state"
+service_stop                        # stop under the normal state dir first
+ro_state="$STATE_DIR"; ro_file="$STATE_FILE"       # the script resolves STATE_DIR once, at load time
+STATE_DIR="$TMP/ro-state"; STATE_FILE="$TMP/ro-state/install.conf"
+APP_DIR_ENV=""; APP_DIR="$TMP/app"
+check "state dir falls back into the install" "$TMP/app/.mirage" "$(state_dir)"
+if service_start >"$TMP/ro-start.log" 2>&1; then pass "background start works with an unwritable state dir"; else fail "start failed: $(tail -4 "$TMP/ro-start.log")"; fi
+if wait_health; then pass "service answers on the spare paths"; else fail "service does not answer"; fi
+if grep -qE "No such file or directory" "$TMP/ro-start.log"; then fail "path errors leaked into the start log"; else pass "no path errors during start"; fi
+check "pid file lands in the fallback dir" "yes" "$([[ -f "$TMP/app/.mirage/mirage.pid" ]] && echo yes || echo no)"
+check "log file lands in the fallback dir" "yes" "$([[ -f "$TMP/app/.mirage/mirage.log" ]] && echo yes || echo no)"
+service_stop
+chmod 700 "$TMP/ro-state"
+STATE_DIR="$ro_state"; STATE_FILE="$ro_file"
+service_start
+if wait_health; then pass "back to the normal state dir"; else fail "service did not come back"; fi
+
 echo "== 5. surviving a moved installation (path changed) =="
 moved="$TMP/moved/elsewhere"
 mkdir -p "$(dirname "$moved")"
@@ -211,6 +282,7 @@ echo "== 6. an install under a non-ASCII path (like ~/Документы/mirage)
 ru_path="$TMP/Документы/mirage"          # Cyrillic path, as in the field report
 mkdir -p "$(dirname "$ru_path")"
 git clone --quiet "$TMP/origin_src" "$ru_path"
+git -C "$ru_path" checkout --quiet -B fix origin/fix    # main is broken by design (step 4f)
 # a unit named as in the field, pointing at the Cyrillic path
 cat >"$TMP/units/mirage.service" <<EOF
 [Unit]

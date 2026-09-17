@@ -291,9 +291,12 @@ out="$(MIRAGE_SEARCH_ROOTS="$TMP" MIRAGE_STATE_FILE="$MOCK_STATE" MIRAGE_UNIT_DI
 if [[ "$out" == *"diagnostics"* ]]; then pass "--doctor runs the pre-flight"; else fail "--doctor produced no diagnostics"; fi
 if [[ "$out" == *"pre-flight"* ]]; then pass "--doctor prints the checklist"; else fail "--doctor checklist missing"; fi
 if [[ "$out" == *"root is required"* ]]; then fail "--doctor demands root (it must not)"; else pass "--doctor works unprivileged"; fi
-for flag in --skip-smoke --offline --force --purge-data --no-hosts; do
+for flag in --branch --skip-smoke --offline --force --purge-data --no-hosts; do
     if bash "$DEPLOY" --help 2>&1 | grep -q -- "$flag"; then pass "$flag documented"; else fail "$flag missing from --help"; fi
 done
+
+out="$(bash "$DEPLOY" --update --branch 2>&1 || true)"
+if [[ "$out" == *"--branch requires a value"* ]]; then pass "--branch validates its argument"; else fail "--branch without a value was accepted"; fi
 
 echo "== non-root guard =="
 out="$(MIRAGE_NO_SUDO=1 bash "$DEPLOY" --update 2>&1 || true)"

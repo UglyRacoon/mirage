@@ -166,6 +166,29 @@ git-состояние (remotes, сеть, грязное дерево, «на �
 только показывает состояние. Флаги: `--skip-smoke` (не запускать тестовый старт релиза),
 `--offline` (не ходить в сеть, работать по локальным ref'ам), `--force` (игнорировать `✗`).
 
+**Если релиз в ветке битый**, обновление отклоняется и печатает причину с точным текстом ошибки:
+```
+  ✗ release does not parse — 1 broken file(s): src/index.js
+      /tmp/…/src/index.js:19
+      SyntaxError: Unexpected token '||'
+[error] the new release was rejected — nothing was changed, the old version keeps running.
+[mirage] release source:  origin/main (commit a1b2c3d)
+[mirage] installed:       main 9f8e7d6 release 1.0.0
+[mirage] This build is broken upstream — there is nothing to fix locally. Options:
+  · wait for a fixed build on origin/main and re-run:  sudo ./deploy.sh --update
+  · deploy another branch/tag that validates:          sudo ./deploy.sh --update --branch <name>
+```
+Пока рабочий релиз не появится в целевой ветке, установка остаётся на текущей версии — сервис не
+останавливается вообще. Если починка лежит в другой ветке (например, открыт PR), обновление можно
+взять прямо из неё:
+```bash
+sudo ./deploy.sh --update --branch arena/01a0ae33-mirage
+BRANCH=v1.2.0 sudo ./deploy.sh --update          # то же через переменную окружения
+```
+Чекаут переключается на указанную ветку/тег (`git checkout -B`; при локальных правках переключение
+отклоняется, `--force` перезаписывает их), выбранный ref попадает в `/etc/mirage/install.conf`
+(`MIRAGE_GIT_REF`), поэтому дальше `--update` без флагов обновляет уже эту ветку.
+
 Любое значение можно переопределить флагом или переменной окружения:
 ```bash
 sudo ./deploy.sh --update --app-dir /srv/apps/mirage --port 8080
@@ -177,8 +200,8 @@ sudo ./deploy.sh --update --fast          # не обходить всю ФС п
 
 #### Тесты скрипта
 ```bash
-bash test/deploy_selftest.sh   # 73 проверки поиска/распознавания (без root)
-bash test/deploy_e2e.sh        # 56 проверок: pre-flight, отклонение битого релиза, откат, перенос установки (без root)
+bash test/deploy_selftest.sh   # 75 проверок поиска/распознавания (без root)
+bash test/deploy_e2e.sh        # 79 проверок: pre-flight, отклонение битого релиза, откат, перенос установки (без root)
 ```
 
 #### Вариант 2: Ручная установка
@@ -447,11 +470,18 @@ stopped**: it is fetched into a scratch dir, every JS file is `node --check`ed, 
 **test-launched on a spare port** with a throwaway database. A broken release is rejected with the
 offending file named and the old version keeps serving; only a release that passes is applied, with
 a backup, a final health check and rollback + logs (`journalctl -u mirage`) if the app then fails to
-start. The same checklist is available on demand via `sudo ./deploy.sh --doctor` (menu item 4);
-`--skip-smoke`, `--offline` and `--force` tune the behaviour.
+start. A build that is broken upstream is reported with the exact compiler error, the offending
+file and what to do about it; until a working build reaches the target branch the installation simply
+stays on its current version, with the service never stopped. If the fix lives on another branch,
+deploy it directly: `sudo ./deploy.sh --update --branch <name>` (also `BRANCH=<name>`); the checkout
+is switched over (`git checkout -B`, refused when the tree has local modifications unless `--force`),
+and the deployed ref is recorded in `/etc/mirage/install.conf` so later updates follow it. The same
+checklist is available on demand via `sudo ./deploy.sh --doctor` (menu item 4); `--skip-smoke`,
+`--offline` and `--force` tune the behaviour. Without a writable `/etc/mirage` the runtime pid/log
+files fall back to `<app>/.mirage` and then `$TMPDIR`, so container installs keep working.
 
-Both test suites run unprivileged: `bash test/deploy_selftest.sh` (73 discovery checks) and
-`bash test/deploy_e2e.sh` (56 checks: pre-flight, broken-release rejection, update, backup, rollback,
+Both test suites run unprivileged: `bash test/deploy_selftest.sh` (75 discovery checks) and
+`bash test/deploy_e2e.sh` (79 checks: pre-flight, broken-release rejection, update, backup, rollback,
 moved install).
 
 > **Do this now:** fresh installs no longer ship a default PIN — a random one is printed to the log

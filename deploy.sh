@@ -54,6 +54,7 @@ SERVICE_NAME_ENV="${SERVICE_NAME:-}"
 NODE_BIN_ENV="${NODE_BIN:-}"
 CHROME_BIN_ENV="${CHROME_BIN:-}"
 REPO="${REPO:-}"
+BRANCH_ENV="${BRANCH:-${REPO_BRANCH:-}}"    # branch/tag to update from (empty = the checkout's own)
 FORCE="${MIRAGE_FORCE:-0}"
 PURGE_DATA=0
 SET_HOSTS="${SET_HOSTS:-1}"
@@ -150,6 +151,7 @@ Options:
       --domain NAME      nginx server_name / /etc/hosts entry (default mirage.local)
       --service NAME     systemd unit name                    (default mirage)
       --repo URL         git repository used by install/update
+      --branch NAME      branch or tag to update from (default: the checkout's own)
       --no-hosts         do not touch /etc/hosts
       --fast             skip the (slow) filesystem walk during discovery
       --skip-smoke       do not test-launch the new release before applying it
@@ -159,13 +161,14 @@ Options:
   -y, --yes              assume "yes" for confirmations (non-interactive)
       --no-sudo          never re-exec through sudo
 
-Env overrides: APP_DIR APP_USER PORT DOMAIN SERVICE_NAME REPO NODE_BIN CHROME_BIN
+Env overrides: APP_DIR APP_USER PORT DOMAIN SERVICE_NAME REPO BRANCH NODE_BIN CHROME_BIN
                DATA_DIR MIRAGE_STATE_FILE MIRAGE_KEEP_BACKUPS BACKUP_ROOT
                MIRAGE_EXTRA_DIRS MIRAGE_SEARCH_ROOTS MIRAGE_SEARCH_DEPTH
                MIRAGE_SCAN_TIMEOUT MIRAGE_NO_FS_SCAN MIRAGE_ASSUME_YES
 
 Examples:
   sudo ./deploy.sh --update                      # any install location
+  sudo ./deploy.sh --update --branch release-2   # update from another branch/tag
   sudo ./deploy.sh --update --app-dir /srv/mirage
   APP_DIR=/home/me/mirage ./deploy.sh --status
 USAGE
@@ -225,6 +228,7 @@ write_state() {
         printf 'MIRAGE_CHROME_BIN="%s"\n'   "$(_state_sanitize "${CHROME:-}")"
         printf 'MIRAGE_DATA_DIR="%s"\n'     "$(_state_sanitize "${DATA_DIR:-}")"
         printf 'MIRAGE_REPO="%s"\n'         "$(_state_sanitize "${REPO:-}")"
+        printf 'MIRAGE_GIT_REF="%s"\n'      "$(_state_sanitize "${GIT_REF:-}")"
         printf 'MIRAGE_INSTALLED_AT="%s"\n' "$(_state_sanitize "$(date -Is 2>/dev/null || date)")"
         printf 'MIRAGE_UPDATED_AT="%s"\n'   "$(_state_sanitize "$(date -Is 2>/dev/null || date)")"
     } >"$STATE_FILE" 2>/dev/null || warn "failed to write $STATE_FILE"
@@ -715,7 +719,20 @@ unit_known() {
     systemctl cat "$n" >/dev/null 2>&1
 }
 
-pidfile() { printf '%s/mirage.pid' "$STATE_DIR"; }
+# Where runtime files (pid, log) can actually be written: the state dir when possible,
+# otherwise inside the installation, otherwise the temp dir. Keeps the no-systemd
+# fallback working for unprivileged or container installs.
+state_dir() {
+    local d
+    for d in "$STATE_DIR" "${APP_DIR:-}/.mirage" "${TMPDIR:-/tmp}/mirage-${APP_USER:-user}"; do
+        [[ -n "$d" && "$d" != "/.mirage" ]] || continue
+        if mkdir -p "$d" 2>/dev/null && [[ -w "$d" ]]; then printf '%s' "$d"; return 0; fi
+    done
+    printf '%s' "${TMPDIR:-/tmp}"
+}
+
+logfile() { printf '%s/mirage.log' "$(state_dir)"; }
+pidfile() { printf '%s/mirage.pid' "$(state_dir)"; }
 
 # pid of a fallback (non-systemd) process, when it is still alive
 bg_pid() {
@@ -758,18 +775,18 @@ service_start() {
         warn "systemd is not available — running Mirage as a background process"
         [[ -n "$NODE_BIN" ]] || { err "node binary unknown — cannot start"; return 1; }
         [[ -d "$APP_DIR" ]]  || { err "app dir $APP_DIR is missing — cannot start"; return 1; }
-        mkdir -p "$STATE_DIR" 2>/dev/null || true
+        local log pidf; log="$(logfile)"; pidf="$(pidfile)"
         # exec keeps the pid stable, so the pid file really points at the server
         ( cd "$APP_DIR" || exit 1
           exec nohup env PORT="$PORT" MIRAGE_DATA="$DATA_DIR" NODE_ENV=production \
-               "$NODE_BIN" src/index.js >>"$STATE_DIR/mirage.log" 2>&1 ) &
-        echo "$!" >"$(pidfile)"
+               "$NODE_BIN" src/index.js >>"$log" 2>&1 ) &
+        echo "$!" >"$pidf" 2>/dev/null || warn "cannot write $pidf"
         sleep 1
         if ! bg_pid >/dev/null; then
-            err "the background process died immediately — see $STATE_DIR/mirage.log"
+            err "the background process died immediately — see $log"
             return 1
         fi
-        say "pid $(bg_pid), log: $STATE_DIR/mirage.log"
+        say "pid $(bg_pid), log: $log"
     fi
     return 0
 }
@@ -986,12 +1003,39 @@ apply_payload() {
     if [[ -d "$APP_DIR/.git" ]]; then
         say "updating git checkout in $APP_DIR"
         git -C "$APP_DIR" fetch --all --prune >/dev/null 2>&1 || warn "git fetch failed (offline?)"
-        local br
-        br="$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
-        if [[ "$br" == "HEAD" ]]; then
-            br="$(git -C "$APP_DIR" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
+        local br cur ref
+        br="${GIT_BRANCH:-}"
+        if [[ -z "$br" ]]; then
+            br="$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+            if [[ "$br" == "HEAD" ]]; then
+                br="$(git -C "$APP_DIR" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
+            fi
+            [[ -n "$br" && "$br" != "HEAD" ]] || br="${BRANCH_ENV:-main}"
         fi
-        [[ -n "$br" && "$br" != "HEAD" ]] || br="${REPO_BRANCH:-main}"
+        ref="${GIT_REF:-origin/$br}"
+        git -C "$APP_DIR" rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || ref="$br"
+        cur="$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+
+        # updating from another branch/tag: switch the deployment checkout over
+        if [[ "$br" != "$cur" ]]; then
+            say "switching the checkout: $cur → $br ($ref)"
+            local dirty co_out co_flags=(-B)
+            dirty="$(git -C "$APP_DIR" status --porcelain 2>/dev/null | grep -v '^??' | head -n 5 || true)"
+            if [[ -n "$dirty" && "$FORCE" != 1 ]]; then
+                err "local modifications prevent the switch:"
+                printf '%s\n' "$dirty" | sed 's/^/      /'
+                say "hint: a deployment checkout should stay pristine — revert them or re-run with --force"
+                return 1
+            fi
+            [[ "$FORCE" == 1 ]] && co_flags=(-f -B)
+            if co_out="$(git -C "$APP_DIR" checkout "${co_flags[@]}" "$br" "$ref" 2>&1)"; then
+                ok "checkout switched to $br ($(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo '?'))"
+                return 0
+            fi
+            err "cannot switch the checkout to '$br':"
+            printf '%s\n' "$co_out" | sed 's/^/      /'
+            return 1
+        fi
         local pull_out
         if pull_out="$(git -C "$APP_DIR" pull --ff-only origin "$br" 2>&1)"; then
             ok "pulled origin/$br"
@@ -1033,6 +1077,8 @@ apply_payload() {
 CHECKS_FAIL=0
 CHECKS_WARN=0
 GIT_BRANCH=""
+GIT_REF=""
+GIT_CUR_BRANCH=""
 GIT_BEHIND=0
 GIT_AHEAD=0
 PREFLIGHT_FETCHED=0
@@ -1072,9 +1118,16 @@ free_port() { # ask node for a port nobody is using
 }
 
 # Prints every JS file of DIR that does not even parse. Returns 1 when broken.
-syntax_check_tree() { # DIR
-    local d="${1%/}" f n="${NODE_BIN:-}"
+NODE_CMD=""
+node_cmd() { # resolved node command used by the checks
+    local n="${NODE_BIN:-}"
     [[ -n "$n" && -x "$n" ]] || n="$(command -v node 2>/dev/null || true)"
+    printf '%s' "$n"
+}
+
+syntax_check_tree() { # DIR
+    local d="${1%/}" f n
+    n="$(node_cmd)"
     [[ -n "$n" ]] || { warn "node is not available for the syntax check"; return 0; }
     local bad=0
     while IFS= read -r f; do
@@ -1115,19 +1168,24 @@ smoke_boot() { # DIR
 # Fetches the candidate release into a temp dir (or points at the local tree).
 prepare_payload() {
     cleanup_stage
-    local tmp
-    if [[ -d "$APP_DIR/.git" && -n "$GIT_BRANCH" ]]; then
+    local tmp ref
+    if [[ -d "$APP_DIR/.git" ]]; then
         if [[ "$OFFLINE" != 1 && "$PREFLIGHT_FETCHED" != 1 ]]; then
-            say "fetching origin/$GIT_BRANCH…"
+            say "fetching origin…"
             git -C "$APP_DIR" fetch --all --prune >/dev/null 2>&1 || warn "git fetch failed — validating the refs known locally"
         fi
+        ref="${GIT_REF:-}"
+        if [[ -z "$ref" ]]; then
+            ref="origin/${GIT_BRANCH:-main}"
+            git -C "$APP_DIR" rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || ref="${GIT_BRANCH:-main}"
+        fi
         tmp="$(mktemp -d)"
-        if git -C "$APP_DIR" archive "origin/$GIT_BRANCH" 2>/dev/null | tar -x -C "$tmp" 2>/dev/null; then
-            STAGE_DIR="$tmp"; STAGE_REF="origin/$GIT_BRANCH"
+        if git -C "$APP_DIR" archive "$ref" 2>/dev/null | tar -x -C "$tmp" 2>/dev/null; then
+            STAGE_DIR="$tmp"; STAGE_REF="$ref"
             return 0
         fi
         rm -rf "$tmp"
-        warn "cannot snapshot origin/$GIT_BRANCH for validation"
+        warn "cannot snapshot $ref for validation"
         return 1
     fi
     if [[ -n "$REPO" ]]; then
@@ -1168,9 +1226,17 @@ validate_payload() { # DIR
     chk_pass "entry point src/index.js present"
 
     local -a broken=()
+    NODE_CMD="$(node_cmd)"        # resolved here: syntax_check_tree runs in a subshell
     while IFS= read -r f; do [[ -n "$f" ]] && broken+=("$f"); done < <(syntax_check_tree "$d" || true)
     if (( ${#broken[@]} )); then
         chk_fail "release does not parse — ${#broken[@]} broken file(s): ${broken[*]}"
+        local f e
+        if [[ -n "$NODE_CMD" ]]; then
+            for f in "${broken[@]}"; do
+                e="$("$NODE_CMD" --check "$d/$f" 2>&1 | head -n 5 || true)"
+                [[ -n "$e" ]] && printf '%s\n' "$e" | sed 's/^/      /'
+            done
+        fi
         return 1
     fi
     chk_pass "all JS files parse cleanly"
@@ -1196,7 +1262,7 @@ dump_start_failure() {
         say "last lines of journalctl -u $unit:"
         journalctl -u "$unit" -n 12 --no-pager 2>/dev/null | sed 's/^/    /' && shown=1
     fi
-    for l in "$STATE_DIR/mirage.log" "$APP_DIR/mirage.log"; do
+    for l in "$(logfile)" "$STATE_DIR/mirage.log" "$APP_DIR/mirage.log"; do
         [[ -f "$l" ]] || continue
         say "tail of $l:"
         tail -n 12 "$l" 2>/dev/null | sed 's/^/    /'
@@ -1327,8 +1393,13 @@ preflight_update() {
             GIT_BRANCH="$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
             if [[ "$GIT_BRANCH" == "HEAD" ]]; then
                 GIT_BRANCH="$(git -C "$APP_DIR" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)"
-                [[ -n "$GIT_BRANCH" ]] || GIT_BRANCH="${REPO_BRANCH:-main}"
+                [[ -n "$GIT_BRANCH" ]] || GIT_BRANCH="main"
                 chk_warn "HEAD is detached — assuming branch '$GIT_BRANCH'"
+            fi
+            GIT_CUR_BRANCH="$GIT_BRANCH"
+            if [[ -n "$BRANCH_ENV" && "$BRANCH_ENV" != "$GIT_BRANCH" ]]; then
+                chk_info "target branch requested: $BRANCH_ENV (the checkout is on $GIT_BRANCH)"
+                GIT_BRANCH="$BRANCH_ENV"
             fi
             if git -C "$APP_DIR" remote get-url origin >/dev/null 2>&1; then
                 chk_pass "origin: $(git -C "$APP_DIR" remote get-url origin)"
@@ -1361,16 +1432,31 @@ preflight_update() {
             else
                 chk_pass "working tree is clean"
             fi
+            GIT_REF=""
             if git -C "$APP_DIR" rev-parse --verify --quiet "origin/$GIT_BRANCH" >/dev/null 2>&1; then
-                GIT_BEHIND="$(git -C "$APP_DIR" rev-list --count "HEAD..origin/$GIT_BRANCH" 2>/dev/null || echo 0)"
-                GIT_AHEAD="$(git -C "$APP_DIR" rev-list --count "origin/$GIT_BRANCH..HEAD" 2>/dev/null || echo 0)"
-                if (( GIT_BEHIND > 0 )); then chk_pass "$GIT_BEHIND commit(s) to pull from origin/$GIT_BRANCH"
-                else chk_info "already at origin/$GIT_BRANCH"; fi
-                if (( GIT_AHEAD > 0 )); then
-                    chk_fail "the checkout is $GIT_AHEAD commit(s) ahead of origin/$GIT_BRANCH — 'pull --ff-only' cannot fast-forward (commit/stash them, or re-run with MIRAGE_HARD_RESET=1 to discard)"
-                fi
+                GIT_REF="origin/$GIT_BRANCH"
+                chk_pass "target ref origin/$GIT_BRANCH ($(git -C "$APP_DIR" rev-parse --short "origin/$GIT_BRANCH" 2>/dev/null || echo '?'), $(git -C "$APP_DIR" log -1 --format=%ci "origin/$GIT_BRANCH" 2>/dev/null | cut -d' ' -f1))"
+            elif git -C "$APP_DIR" rev-parse --verify --quiet "$GIT_BRANCH" >/dev/null 2>&1; then
+                GIT_REF="$GIT_BRANCH"
+                chk_pass "target ref $GIT_BRANCH exists (tag/commit)"
             else
-                chk_warn "origin/$GIT_BRANCH is not known locally yet"
+                chk_fail "ref '$GIT_BRANCH' was not found locally or on origin"
+            fi
+            if [[ -n "$GIT_REF" ]]; then
+                GIT_BEHIND="$(git -C "$APP_DIR" rev-list --count "HEAD..$GIT_REF" 2>/dev/null || echo 0)"
+                GIT_AHEAD="$(git -C "$APP_DIR" rev-list --count "$GIT_REF..HEAD" 2>/dev/null || echo 0)"
+                if [[ "$GIT_BRANCH" != "$GIT_CUR_BRANCH" ]]; then
+                    chk_info "the checkout will switch from '$GIT_CUR_BRANCH' to '$GIT_BRANCH'"
+                fi
+                if (( GIT_BEHIND > 0 )); then chk_pass "$GIT_BEHIND commit(s) to pull from $GIT_REF"
+                else chk_info "already at $GIT_REF"; fi
+                if (( GIT_AHEAD > 0 )); then
+                    if [[ "$GIT_BRANCH" == "$GIT_CUR_BRANCH" ]]; then
+                        chk_fail "the checkout is $GIT_AHEAD commit(s) ahead of $GIT_REF — 'pull --ff-only' cannot fast-forward (commit/stash them, or re-run with MIRAGE_HARD_RESET=1 to discard)"
+                    else
+                        chk_warn "$GIT_AHEAD local commit(s) on $GIT_CUR_BRANCH are not part of $GIT_BRANCH and will not be deployed"
+                    fi
+                fi
             fi
         else
             chk_fail "the installation is a git checkout but git is not installed"
@@ -1494,9 +1580,13 @@ do_install() {
     # ---- app files ----
     mkdir -p "$APP_DIR"
     if [[ -n "$REPO" ]]; then
-        say "cloning $REPO → $APP_DIR"
+        say "cloning $REPO${BRANCH_ENV:+ (branch $BRANCH_ENV)} → $APP_DIR"
         local tmp; tmp="$(mktemp -d)"
-        git clone --depth 1 "$REPO" "$tmp" || die "git clone $REPO failed"
+        if [[ -n "$BRANCH_ENV" ]]; then
+            git clone --depth 1 --branch "$BRANCH_ENV" "$REPO" "$tmp" || die "git clone -b $BRANCH_ENV $REPO failed"
+        else
+            git clone --depth 1 "$REPO" "$tmp" || die "git clone $REPO failed"
+        fi
         cp -a "$tmp/." "$APP_DIR/"; rm -rf "$tmp"
     else
         say "copying tree from $SELF_DIR → $APP_DIR"
@@ -1601,7 +1691,7 @@ EOF
     ok "Mirage deployed successfully."
     say "Open:        http://$DOMAIN  (or http://127.0.0.1:$PORT)"
     say "PIN:         printed in the server log on first run (change it in Team)"
-    say "Logs:        journalctl -u ${SERVICE_NAME%.service} -f   (or $STATE_DIR/mirage.log without systemd)"
+    say "Logs:        journalctl -u ${SERVICE_NAME%.service} -f   (or $(logfile) without systemd)"
     [[ -n "$CHROME" ]] && say "Chromium:    $CHROME"
     return 0
 }
@@ -1662,12 +1752,21 @@ do_update() {
     fi
     if ! validate_payload "$STAGE_DIR"; then
         err "the new release was rejected — nothing was changed, the old version keeps running."
-        say "release source: $STAGE_REF"
-        say "publish a fixed build and re-run:  sudo ./deploy.sh --update"
+        local sha=""
+        [[ -d "$APP_DIR/.git" ]] && sha="$(git -C "$APP_DIR" rev-parse --short "$STAGE_REF" 2>/dev/null || true)"
+        say "release source:  $STAGE_REF${sha:+ (commit $sha)}"
+        if [[ -d "$APP_DIR/.git" ]]; then
+            say "installed:       $GIT_CUR_BRANCH $(git -C "$APP_DIR" log -1 --format='%h %s' HEAD 2>/dev/null || true)"
+        fi
+        echo ""
+        say "This build is broken upstream — there is nothing to fix locally. Options:"
+        say "  · wait for a fixed build on $STAGE_REF and re-run:  sudo ./deploy.sh --update"
+        say "  · deploy another branch/tag that validates:          sudo ./deploy.sh --update --branch <name>"
+        say "  · check what the release contains:                   git -C '$APP_DIR' log --oneline -5 $STAGE_REF"
         cleanup_stage
         return 1
     fi
-    if [[ "$STAGE_REF" == origin/* && "$GIT_BEHIND" == 0 && "$FORCE" != 1 ]]; then
+    if [[ -n "$GIT_REF" && "$GIT_BRANCH" == "$GIT_CUR_BRANCH" && "$GIT_BEHIND" == 0 && "$FORCE" != 1 ]]; then
         ok "already at $STAGE_REF — there is nothing to pull, the installed version is the latest."
         dim "  (use --force to re-apply the tree and restart the service anyway)"
         cleanup_stage
@@ -1943,6 +2042,9 @@ main() {
             --domain)  [[ -n "${2:-}" ]] || die "--domain requires a value";  DOMAIN_ENV="$2"; shift ;;
             --service) [[ -n "${2:-}" ]] || die "--service requires a value"; SERVICE_NAME_ENV="$2"; shift ;;
             --repo)    [[ -n "${2:-}" ]] || die "--repo requires a value";    REPO="$2"; shift ;;
+            --branch|--ref|--tag)
+                [[ -n "${2:-}" ]] || die "--branch requires a value"
+                BRANCH_ENV="$2"; shift ;;
             *) warn "unknown option: $1"; usage; return 2 ;;
         esac
         shift
