@@ -25,8 +25,31 @@ window.onLiveMsg = (m) => {  if (App.state.view !== 'live') return;
   if (m.type === 'meta') { Live.meta = m; const el = document.getElementById('resTxt'); const sw = m.screenWidth || m.deviceWidth || m.screenshotWidth; if (el && sw) el.textContent = `${sw}×${m.screenHeight || m.deviceHeight || m.screenshotHeight || '?'} @${(m.deviceScaleFactor || m.pageScaleFactor || 1).toFixed(2)}x`; }
   else if (m.type === 'targets') { App.state.live.targets = m.targets || []; drawTabStrip(); syncUrlBar(m.targets); }
   else if (m.type === 'nav') { const u = document.getElementById('liveUrl'); if (u && document.activeElement !== u) u.value = m.url || ''; }
+  else if (m.type === 'clipboard') { handleClipboard(m); }
   else if (m.type === 'closed') { toast('Kernel session closed', 'warn'); go('#/profiles'); }
 };
+
+// Обработка буфера обмена между системой и антидетект-браузером
+async function handleClipboard(m) {
+  if (m.action === 'copy' && typeof m.text === 'string') {
+    // Копирование из браузера в системный буфер
+    try {
+      await navigator.clipboard.writeText(m.text);
+      toast('Copied to system clipboard', 'ok');
+    } catch (e) {
+      // Fallback для старых браузеров
+      const ta = document.createElement('textarea');
+      ta.value = m.text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); toast('Copied to system clipboard', 'ok'); }
+      catch (e2) { toast('Copy failed: ' + e2.message, 'err'); }
+      document.body.removeChild(ta);
+    }
+  }
+}
 
 function drawTabStrip() {
   const strip = document.getElementById('tabStrip'); if (!strip) return;
@@ -128,6 +151,13 @@ ROUTES.live = (view, params) => {
     return { x: Math.round((e.clientX - r.left) / r.width * sw), y: Math.round((e.clientY - r.top) / r.height * sh) };
   };
   stage.addEventListener('mousedown', e => { if (e.target !== img) return; focused = true; stage.focus(); document.getElementById('lvHint').textContent = 'input captured · Esc to release'; });
+  // Автофокус при переключении вкладки - чтобы не нужно было нажимать Tab перед вводом
+  const observer = new MutationObserver(() => {
+    if (focused && document.activeElement !== stage && !['liveUrl'].includes(document.activeElement?.id)) {
+      stage.focus();
+    }
+  });
+  observer.observe(strip, { childList: true, subtree: true });
   stage.addEventListener('contextmenu', e => e.preventDefault());
   img.addEventListener('pointerdown', e => {
     if (!focused) return;
@@ -155,13 +185,44 @@ ROUTES.live = (view, params) => {
     e.preventDefault();
     const mods = (e.ctrlKey ? 2 : 0) | (e.altKey ? 1 : 0) | (e.shiftKey ? 8 : 0) | (e.metaKey ? 4 : 0);
     const printable = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
-    if (printable) { wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, text: e.key, modifiers: mods } }); wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyUp', key: e.key, modifiers: mods } }); }
-    else wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: e.repeat ? 'keyDown' : 'keyDown', key: e.key, code: e.code || '', modifiers: mods } });
+    
+    // Обработка горячих клавиш буфера обмена (Ctrl+C, Ctrl+V, Ctrl+X)
+    if ((e.ctrlKey || e.metaKey) && ['c', 'v', 'x'].includes(e.key.toLowerCase())) {
+      if (e.key.toLowerCase() === 'c' || e.key.toLowerCase() === 'x') {
+        // Copy/Cut - читаем выделенный текст из браузера
+        wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'clipboard', action: e.key.toLowerCase() === 'c' ? 'copy' : 'cut' } });
+        // Также отправляем обычное событие клавиши для совместимости
+        wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, code: e.code || '', modifiers: mods } });
+      } else if (e.key.toLowerCase() === 'v') {
+        // Paste - запрашиваем текст из системного буфера и вставляем в браузер
+        (async () => {
+          try {
+            const text = await navigator.clipboard.readText();
+            wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'clipboard', action: 'paste', text: text } });
+          } catch (err) {
+            toast('Paste failed: access denied', 'warn');
+          }
+        })();
+        // Также отправляем обычное событие клавиши для совместимости
+        wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, code: e.code || '', modifiers: mods } });
+      }
+      return; // Не отправляем больше ничего для Ctrl+C/V/X
+    }
+    
+    // Для печатных символов отправляем только keyDown (текст вставится через insertText на бэкенде)
+    if (printable) { 
+      wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, text: e.key, modifiers: mods } }); 
+    }
+    else wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, code: e.code || '', modifiers: mods } });
   });
   stage.addEventListener('keyup', e => {
-    if (!focused || e.key.length === 1) return;
+    if (!focused) return;
     const mods = (e.ctrlKey ? 2 : 0) | (e.altKey ? 1 : 0) | (e.shiftKey ? 8 : 0) | (e.metaKey ? 4 : 0);
-    wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyUp', key: e.key, code: e.code || '', modifiers: mods } });
+    // Отправляем keyUp только для НЕпечатных клавиш (модификаторы, стрелки и т.д.)
+    const printable = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
+    if (!printable) {
+      wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyUp', key: e.key, code: e.code || '', modifiers: mods } });
+    }
   });
 };
 

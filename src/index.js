@@ -107,6 +107,24 @@ async function main() {
           if (ev.kind === 'mouse') bm.inputMouse(pid, ev).catch(() => { });
           else if (ev.kind === 'key') bm.inputKey(pid, ev).catch(() => { });
           else if (ev.kind === 'wheel') bm.inputMouse(pid, { type: 'mouseWheel', x: ev.x, y: ev.y, deltaX: ev.deltaX || 0, deltaY: ev.deltaY || 0 }).catch(() => { });
+          else if (ev.kind === 'clipboard') {
+            // Обработка буфера обмена: copy/cut/paste между системой и браузером
+            if (ev.action === 'copy' || ev.action === 'cut') {
+              // Копирование из браузера в системный буфер - читаем выделенный текст через CDP
+              (async () => {
+                try {
+                  const text = await bm.evaluate(pid, 'document.getSelection()?.toString() || ""');
+                  // Отправляем текст клиенту для сохранения в системный буфер
+                  hub.broadcast(msg.channel, { type: 'clipboard', action: 'copy', text: text || '' });
+                } catch (e) { }
+              })();
+            } else if (ev.action === 'paste') {
+              // Вставка из системного буфера в браузер - текст приходит от клиента
+              if (ev.text) {
+                await bm.inputKey(pid, { type: 'char', key: ev.text, text: ev.text });
+              }
+            }
+          }
         } catch (e) { }
         return;
       }
