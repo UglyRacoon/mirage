@@ -8,7 +8,9 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "selftest": "node test/selftest.js"
+    "selftest": "node test/selftest.js",
+    "selftest:deploy": "bash test/deploy_selftest.sh",
+    "selftest:deploy:e2e": "bash test/deploy_e2e.sh"
   },
   "bin": { "mirage": "src/index.js" },
   "license": "MIT"

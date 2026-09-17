@@ -75,18 +75,139 @@ Mirage **честно показывает** реальный JA3/JA4 (F7), но
 #### Вариант 1: Интерактивный скрипт (рекомендуется)
 На **любом** свежем Linux запустите интерактивный скрипт установки:
 ```bash
-sudo ./deploy.sh
+sudo ./deploy.sh                 # меню
+sudo ./deploy.sh --install       # установка / починка
+sudo ./deploy.sh --update        # обновление (где бы ни лежала установка)
+sudo ./deploy.sh --uninstall     # удаление (данные профилей сохраняются)
+sudo ./deploy.sh --status        # что и как найдено
+sudo ./deploy.sh --doctor        # расширенная диагностика + pre-flight (ничего не меняет)
 ```
-Скрипт предложит меню с тремя опциями:
-1. **Install Mirage** — установка всех зависимостей (Node.js 22, Chromium, Xvfb, nginx), создание systemd-юнита, настройка nginx vhost, запуск сервиса
-2. **Update Mirage** — обновление до последней версии с автоматическим бэкапом и откатом при ошибке
-3. **Uninstall Mirage** — полное удаление приложения с подтверждением
+Меню: `1) Install · 2) Update · 3) Uninstall · 4) Status · 5) Exit`; в заголовке сразу видно,
+**какая установка обнаружена**.
+
+**Скрипт ничего не предполагает о путях.** Каталог установки ищется сам, по порядку:
+1. явные `APP_DIR=` / `--app-dir` (если заданы — используются как есть);
+2. файл состояния `/etc/mirage/install.conf` (пишется при установке/обновлении);
+3. systemd-юниты — `ExecStart`/`WorkingDirectory` **любого** юнита (`mirage.service`, `mirage-alt.service`, даже переименованного);
+4. запущенный процесс (`/proc/*/cmdline` → `…/src/index.js`, плюс `cwd`);
+5. типовые каталоги: `/opt`, `/srv`, `/var/www`, `/usr/local`, `/var/lib`, `/root`, `/home/*`, `/data`, `/app`, `/mnt`…;
+6. `locate(1)`, если установлен;
+7. обход ФС: каталоги с `mirage` в имени, затем поиск по `package.json` (для деревьев с любым именем).
+
+По тем же правилам определяются: пользователь сервиса, порт, домен, имя systemd-юнита, `node`,
+Chromium, каталог данных и nginx-vhost. Установка распознаётся по содержимому (маркер
+`.mirage-install`, `package.json`, `src/index.js`, `src/api.js`, `public/index.html`), а не по имени
+каталога, поэтому её можно свободно переносить. Копия репозитория, из которой запущен сам скрипт,
+**никогда не принимается за установку без явного `--app-dir`**.
+
+Что делает каждая функция:
+1. **Install** — ставит только отсутствующее (Node ≥ 22, Chromium, Xvfb, nginx), создаёт юнит + vhost
+   + запись в `/etc/hosts`, запускает сервис. Идемпотентно; при уже найденной установке предложит
+   обновление. Поддерживаются apt/dnf/yum/zypper/pacman; если пакета нет — Node ставится из
+   официального tarball'а, а Chromium ищется в snap/puppeteer/playwright-кэшах.
+2. **Update** — работает с **любым** найденным каталогом (git-чекаут → `git pull --ff-only`,
+   обычное дерево → синхронизация из `REPO`/текущего дерева с сохранением `data/`), делает
+   ротируемый бэкап (`MIRAGE_KEEP_BACKUPS`, по умолчанию 5) и **автоматически откатывается**, если
+   приложение не поднялось (health-check по HTTP).
+3. **Uninstall** — останавливает сервис, удаляет юнит/vhost/каталог; **данные профилей копируются в
+   `mirage_data_*` перед удалением** (полное удаление — `--purge-data`). Системные пакеты не трогает.
+4. **Status** — печатает всё найденное и из какого источника, плюс проверку ответа приложения.
+
+Работает и без systemd (контейнеры/WSL): сервис поднимается фоновым процессом с pid-файлом в
+`/etc/mirage/mirage.pid`, вывод — в `/etc/mirage/mirage.log`; nginx не обязателен.
+
+#### Диагностика перед обновлением (pre-flight)
+Перед любым изменением `Update` прогоняет проверки и **ничего не меняет, пока они не пройдены**
+(нулевой простой при неудаче):
+
+```
+[mirage] Pre-flight checks (nothing has been changed yet)…
+  ✓ app dir: /home/pluton/Документы/mirage
+  ✓ package.json present
+  ✓ app dir is writable
+  ✓ service user 'pluton' exists
+  ✓ service user can access the tree (owner pluton, mode 755)
+  ✓ node v22.7.0 at /usr/bin/node
+  ✓ chromium: /usr/bin/chromium
+  ✓ systemd unit: /etc/systemd/system/mirage.service
+  ✓ unit WorkingDirectory matches the app dir
+  ✓ unit ExecStart points into the app dir
+  ✓ unit is enabled
+  ✓ service is currently active
+  ✓ port 7788 is held by this service
+  ✓ data dir: …/data + writable
+  ✓ free space for the backup: 19737MB in /home
+  ✓ nginx config is valid (/etc/nginx/conf.d/mirage.conf)
+  ✓ installation is a git checkout
+  ✓ origin: https://github.com/…/mirage.git
+  ✓ git remote is reachable
+  ✓ fetched the latest refs
+  ✓ working tree is clean
+  ✓ 3 commit(s) to pull from origin/main
+```
+
+Проверяется: само дерево и права, сервисный пользователь, `node` (и совпадает ли он с юнитом),
+Chromium, согласованность юнита (`ExecStart`/`WorkingDirectory`/enabled/masked), занят ли порт и
+активен ли сервис, доступность и место под каталог данных, свободное место под бэкап, `nginx -t`,
+git-состояние (remotes, сеть, грязное дерево, «на сколько коммитов отстали/убежали вперёд»). Каждая
+строка помечена `✓` / `!` (предупреждение) / `✗` (блокер). При `✗` обновление останавливается с
+подсказкой, что именно исправить; `--force` позволяет проигнорировать.
+
+**Дальше проверяется сам релиз, до остановки сервиса:**
+1. payload скачивается в отдельный временный каталог (release ещё не применён);
+2. `node --check` по всем JS-файлам — синтаксическая ошибка в релизе отклоняется с указанием файла;
+3. **тестовый запуск релиза на свободном порту** с временной базой: если новая версия не поднимается и
+   не отвечает по HTTP — обновление отклоняется, старая версия продолжает работать (откат не нужен);
+4. только после этого сервис останавливается, делается бэкап, применяется код и выполняется запуск с
+   финальной проверкой; при неудаче — автоматический откат из бэкапа и вывод логов
+   (`journalctl -u mirage` / `/etc/mirage/mirage.log`), чтобы причина была видна сразу.
+
+Тот же чек-лист доступен вручную: `sudo ./deploy.sh --doctor` (пункт 4 меню) — ничего не меняет,
+только показывает состояние. Флаги: `--skip-smoke` (не запускать тестовый старт релиза),
+`--offline` (не ходить в сеть, работать по локальным ref'ам), `--force` (игнорировать `✗`).
+
+**Если релиз в ветке битый**, обновление отклоняется и печатает причину с точным текстом ошибки:
+```
+  ✗ release does not parse — 1 broken file(s): src/index.js
+      /tmp/…/src/index.js:19
+      SyntaxError: Unexpected token '||'
+[error] the new release was rejected — nothing was changed, the old version keeps running.
+[mirage] release source:  origin/main (commit a1b2c3d)
+[mirage] installed:       main 9f8e7d6 release 1.0.0
+[mirage] This build is broken upstream — there is nothing to fix locally. Options:
+  · wait for a fixed build on origin/main and re-run:  sudo ./deploy.sh --update
+  · deploy another branch/tag that validates:          sudo ./deploy.sh --update --branch <name>
+```
+Пока рабочий релиз не появится в целевой ветке, установка остаётся на текущей версии — сервис не
+останавливается вообще. Если починка лежит в другой ветке (например, открыт PR), обновление можно
+взять прямо из неё:
+```bash
+sudo ./deploy.sh --update --branch arena/01a0ae33-mirage
+BRANCH=v1.2.0 sudo ./deploy.sh --update          # то же через переменную окружения
+```
+Чекаут переключается на указанную ветку/тег (`git checkout -B`; при локальных правках переключение
+отклоняется, `--force` перезаписывает их), выбранный ref попадает в `/etc/mirage/install.conf`
+(`MIRAGE_GIT_REF`), поэтому дальше `--update` без флагов обновляет уже эту ветку.
+
+Любое значение можно переопределить флагом или переменной окружения:
+```bash
+sudo ./deploy.sh --update --app-dir /srv/apps/mirage --port 8080
+APP_DIR=/home/me/mirage DOMAIN=mirage.lan sudo ./deploy.sh --status
+sudo ./deploy.sh --update --fast          # не обходить всю ФС при поиске
+```
 
 После установки **смените PIN** в интерфейсе Team и, при удалённом доступе, закройте vhost за TLS + авторизацией.
 
+#### Тесты скрипта
+```bash
+bash test/deploy_selftest.sh   # 75 проверок поиска/распознавания (без root)
+bash test/deploy_e2e.sh        # 79 проверок: pre-flight, отклонение битого релиза, откат, перенос установки (без root)
+```
+
 #### Вариант 2: Ручная установка
 - На этом хосте: сервис `mirage` под systemd + nginx (см. §6).
-- Альтернативно: one-shot `sudo ./deploy.sh` (выберите пункт 1 в меню) установит Node 22 + chromium + Xvfb + nginx, создаст юнит, vhost, пропишет `/etc/hosts`; идемпотентен.
+- Альтернативно: `sudo ./deploy.sh --install` (или пункт 1 в меню) — идемпотентно поставит
+  Node 22 + chromium + Xvfb + nginx, создаст юнит, vhost, пропишет `/etc/hosts`.
 
 MIT-подобная лицензия. Не юридический совет — соблюдайте правила каждой платформы (ToS).
 
@@ -309,22 +430,59 @@ Verified through the domain: SPA 200, login + `/api/stats` over the proxy, WS **
 Protocols**, kernel launch (mode xvfb, dedicated display), and the in-kernel checker
 **score 100 / 0 leaks** — all via `http://mirage.hata`.
 
-### One-shot deploy on any Linux server (`deploy.sh`)
+### Adaptive deploy on any Linux server (`deploy.sh`)
 
-`deploy.sh` turns a bare Debian/Ubuntu/RHEL box into a running Mirage instance:
+`deploy.sh` turns a bare Debian/Ubuntu/RHEL box into a running Mirage instance — and, more
+importantly, it **finds an existing installation wherever it lives** instead of assuming `/opt/mirage`:
 
 ```bash
 # on the target server (needs root / sudo):
-sudo ./deploy.sh                # installs node 22 + chromium + xvfb + nginx,
-                                 # drops in the systemd unit + nginx vhost + /etc/hosts,
-                                 # enables & starts mirage, prints the URL + default PIN
+sudo ./deploy.sh                # menu: 1 Install · 2 Update · 3 Uninstall · 4 Status · 5 Exit
+sudo ./deploy.sh --update       # updates the detected install, backs it up, rolls back on failure
+sudo ./deploy.sh --status       # prints what was detected and from which source
+sudo ./deploy.sh --update --app-dir /srv/mirage --port 8080 --fast
 ```
 
-It is idempotent (safe to re-run), detects apt vs dnf, and leaves the service under
-`systemd` (`mirage`) reachable on port 80. Edit the `DOMAIN`/`APP_USER`/`PORT` vars at the top
-of the script to taste. For the SPA+API build, the script copies the working tree (or you point
-`REPO` at a git checkout). After deploy, **change the default PIN in Team** and (if remote)
-front it with TLS + auth.
+Discovery order: explicit `APP_DIR`/`--app-dir` → state file `/etc/mirage/install.conf` → any
+systemd unit (`ExecStart`/`WorkingDirectory`, unit may be renamed) → running process
+(`/proc/*/cmdline`) → well-known directories (`/opt`, `/srv`, `/var/www`, `/usr/local`, `/root`,
+`/home/*`, …) → `locate(1)` → filesystem walk (dirs named `*mirage*`, then `package.json` markers).
+The same technique resolves the service user, port, domain, unit name, node/chromium binaries, data
+dir and nginx vhost. Trees are recognised by content (`.mirage-install`, `package.json`, `src/*`),
+so a moved or renamed install keeps working; the checkout the script itself is run from is never
+adopted implicitly.
+
+Install is idempotent and installs only what is missing (apt/dnf/yum/zypper/pacman; Node 22 from
+NodeSource or the official tarball; chromium also searched in snap/puppeteer/playwright caches).
+Update works for git checkouts (`git pull --ff-only`) and plain trees (sync from `REPO`/local tree,
+`data/` preserved), keeps `MIRAGE_KEEP_BACKUPS` rotating backups (default 5) and rolls back
+automatically when the health check fails. Uninstall keeps a `mirage_data_*` copy of the profiles
+unless `--purge-data` is given. On boxes without systemd the service runs as a background process
+(pid file + log in `/etc/mirage/`); nginx is optional. After deploy, **change the default PIN in
+Team** and (if remote) front it with TLS + auth.
+
+**Pre-flight before every update.** `Update` first runs a full checklist (tree and permissions,
+service user, node/chromium, unit consistency incl. `ExecStart`/`WorkingDirectory`/enabled/masked,
+port and service state, data dir, free space for the backup, `nginx -t`, git remotes/network/dirty
+tree/ahead-behind) and stops at the first ✗ with an actionable hint — nothing is changed, so a failed
+pre-flight costs zero downtime. Then the **candidate release is validated before the service is even
+stopped**: it is fetched into a scratch dir, every JS file is `node --check`ed, and the release is
+**test-launched on a spare port** with a throwaway database. A broken release is rejected with the
+offending file named and the old version keeps serving; only a release that passes is applied, with
+a backup, a final health check and rollback + logs (`journalctl -u mirage`) if the app then fails to
+start. A build that is broken upstream is reported with the exact compiler error, the offending
+file and what to do about it; until a working build reaches the target branch the installation simply
+stays on its current version, with the service never stopped. If the fix lives on another branch,
+deploy it directly: `sudo ./deploy.sh --update --branch <name>` (also `BRANCH=<name>`); the checkout
+is switched over (`git checkout -B`, refused when the tree has local modifications unless `--force`),
+and the deployed ref is recorded in `/etc/mirage/install.conf` so later updates follow it. The same
+checklist is available on demand via `sudo ./deploy.sh --doctor` (menu item 4); `--skip-smoke`,
+`--offline` and `--force` tune the behaviour. Without a writable `/etc/mirage` the runtime pid/log
+files fall back to `<app>/.mirage` and then `$TMPDIR`, so container installs keep working.
+
+Both test suites run unprivileged: `bash test/deploy_selftest.sh` (75 discovery checks) and
+`bash test/deploy_e2e.sh` (79 checks: pre-flight, broken-release rejection, update, backup, rollback,
+moved install).
 
 > **Do this now:** fresh installs no longer ship a default PIN — a random one is printed to the log
 > once on first run; an *existing* install that still uses the historical PIN `mirage` keeps working

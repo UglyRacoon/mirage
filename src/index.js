@@ -91,7 +91,7 @@ async function main() {
     const member = api.memberFor(conn.req);            // session member (upgrade carried the cookie)
     const byKey = !!api.apiKeyFor(conn.req);           // API-key client (e.g. ?key= in ws url)
     const canOperateWs = (byKey || (member && member.role !== 'viewer'));
-    conn.on('message', (buf) => {
+    conn.on('message', async (buf) => {
       let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
       if (msg.type === 'ping') return conn.sendJSON({ type: 'pong', t: Date.now() });
       if (msg.type === 'subscribe' && msg.channel) {

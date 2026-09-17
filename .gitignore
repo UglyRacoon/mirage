@@ -2,6 +2,9 @@
 # Dependencies
 node_modules/
 
+# Runtime data (SQLite db + per-profile kernel dirs, created on first run)
+/data/
+
 # Build artifacts
 dist/
 build/
