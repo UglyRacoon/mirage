@@ -178,7 +178,7 @@ sudo ./deploy.sh --update --fast          # не обходить всю ФС п
 #### Тесты скрипта
 ```bash
 bash test/deploy_selftest.sh   # 73 проверки поиска/распознавания (без root)
-bash test/deploy_e2e.sh        # 50 проверок: pre-flight, отклонение битого релиза, откат, перенос установки (без root)
+bash test/deploy_e2e.sh        # 56 проверок: pre-flight, отклонение битого релиза, откат, перенос установки (без root)
 ```
 
 #### Вариант 2: Ручная установка
@@ -451,7 +451,7 @@ start. The same checklist is available on demand via `sudo ./deploy.sh --doctor`
 `--skip-smoke`, `--offline` and `--force` tune the behaviour.
 
 Both test suites run unprivileged: `bash test/deploy_selftest.sh` (73 discovery checks) and
-`bash test/deploy_e2e.sh` (50 checks: pre-flight, broken-release rejection, update, backup, rollback,
+`bash test/deploy_e2e.sh` (56 checks: pre-flight, broken-release rejection, update, backup, rollback,
 moved install).
 
 > **Do this now:** fresh installs no longer ship a default PIN — a random one is printed to the log
