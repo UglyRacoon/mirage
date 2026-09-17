@@ -141,6 +141,12 @@ async function main() {
     conn.on('close', () => { for (const c of conn._channels) hub.leave(c, conn); });
   }, (req) => api.authOk(req));
   function startLive(pid) { try { if (bm.isRunning(pid)) bm.startLive(pid, { fps: loadSettings().liveFps || 6 }); } catch (e) { } }
+  const _inputSeen = new Set();  // pid with ≥1 input event received (logged once)
+  const _inputOk = new Set();    // pid with ≥1 input event acked by the kernel (logged once)
+  function noteInputOk(pid, ev) {
+    if (_inputOk.has(pid)) return; _inputOk.add(pid);
+    log('live-input', pid + ': dispatched to kernel, CDP ack (first: ' + ((ev && ev.kind) || '?') + '/' + ((ev && (ev.type || ev.action)) || '?') + ')');
+  }
   const _inputErr = new Map();   // pid -> { n, last } — so "clicks do nothing" is diagnosable
   function noteInputError(pid, e) {
     const r = _inputErr.get(pid) || { n: 0, last: 0 };

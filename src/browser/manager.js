@@ -379,6 +379,7 @@ export class BrowserManager {
     if (ev.kind === 'touch' || ev.pointerType === 'touch') {
       const map = { mousePressed: 'touchStart', mouseReleased: 'touchEnd', mouseMoved: 'touchMove' };
       await s.cdp.send('Input.dispatchTouchEvent', { type: map[ev.type] || 'touchMove', touchPoints: [{ x, y }] }, t.sessionId);
+      s.inputCount = (s.inputCount || 0) + 1; s.lastInputEv = ev.type;
       return;
     }
     await s.cdp.send('Input.dispatchMouseEvent', {
@@ -388,6 +389,7 @@ export class BrowserManager {
       buttons: ev.buttons ?? (ev.type === 'mousePressed' ? 1 : 0),
       deltaX: ev.deltaX || 0, deltaY: ev.deltaY || 0, pointerType: 'mouse',
     }, t.sessionId);
+    s.inputCount = (s.inputCount || 0) + 1; s.lastInputEv = ev.type;
   }
   async inputKey(profileId, ev) {
     const s = this._need(profileId); const t = this._pick(s); s._lastInput = Date.now();
@@ -406,6 +408,7 @@ export class BrowserManager {
     if (type !== 'keyUp' && typeof ev.text === 'string' && ev.text.length === 1) { params.text = ev.text; params.unmodifiedText = ev.text; }
     if (ev.repeat) params.autoRepeat = true;
     await s.cdp.send('Input.dispatchKeyEvent', params, t.sessionId);
+    s.inputCount = (s.inputCount || 0) + 1; s.lastInputEv = type;
   }
 
   // ---- behavioral humanization (fluent, curved, variable-speed input) ----

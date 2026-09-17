@@ -265,6 +265,7 @@ ROUTES.live = (view, params) => {
     const mods = (e.ctrlKey ? 2 : 0) | (e.altKey ? 1 : 0) | (e.shiftKey ? 8 : 0) | (e.metaKey ? 4 : 0);
     wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyUp', key: e.key, code: e.code || '', modifiers: mods } });
   });
+  console.info('[mirage] live input armed for ' + pid);
 };
 
 /* ===================== FINGERPRINT LAB ===================== */
