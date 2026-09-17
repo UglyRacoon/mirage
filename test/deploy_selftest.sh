@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Smoke tests for deploy.sh discovery/adoption logic.
 # Runs as an unprivileged user: no systemd, no root, no real installation needed —
-# every system path is redirected into a temporary mock root.
+# installation discovery uses temporary fixtures, never host processes/nginx.
 #
 #   bash test/deploy_selftest.sh
 set -uo pipefail
@@ -56,6 +56,14 @@ make_foreign_app "$TMP/not-mirage"
 echo '{"name":"totally-not-mirage"}' >"$TMP/not-mirage/package.json"
 
 # ------------------------------------------------------------------ harness
+# Executable Node fixture, and no access to the host's locate database.
+mkdir -p "$TMP/bin" "$TMP/empty-common"
+MOCK_NODE="$TMP/bin/node"
+ln -s "$(command -v node)" "$MOCK_NODE"
+printf '#!/bin/sh\nexit 0\n' >"$TMP/bin/locate"
+chmod +x "$TMP/bin/locate"
+export PATH="$TMP/bin:$PATH"
+export MIRAGE_TEST_ISOLATION=1
 MOCK_STATE="$TMP/etc/mirage/install.conf"
 export MIRAGE_UNIT_DIRS="$TMP/units"
 export MIRAGE_STATE_FILE="$MOCK_STATE"
@@ -63,8 +71,7 @@ export MIRAGE_STATE_DIR="$TMP/etc/mirage"
 export MIRAGE_NO_SUDO=1
 export MIRAGE_SEARCH_ROOTS="$TMP"
 export MIRAGE_SEARCH_DEPTH=6
-SELF_DIR_PARENT="$(dirname "$SELF_DIR")"
-export MIRAGE_COMMON_DIRS=""
+export MIRAGE_COMMON_DIRS="$TMP/empty-common"
 export MIRAGE_EXTRA_DIRS=""
 export MIRAGE_ASSUME_YES=0
 export MIRAGE_KEEP_BACKUPS=3
@@ -103,7 +110,7 @@ MIRAGE_APP_USER="bob"
 MIRAGE_PORT="9001"
 MIRAGE_DOMAIN="mirage.hata"
 MIRAGE_SERVICE="mirage-alt.service"
-MIRAGE_NODE_BIN="/usr/local/bin/node"
+MIRAGE_NODE_BIN="$MOCK_NODE"
 EOF
 d=""; find_mirage_dir && d="$FOUND_DIR"
 check "state dir found" "$TMP/home/bob/antidetect-kit" "$d"
@@ -123,7 +130,7 @@ Description=Mirage anti-detect browser
 User=srvuser
 WorkingDirectory=$TMP/srv/web/mirage-1.4
 Environment=PORT=8899
-ExecStart=/usr/local/bin/node $TMP/srv/web/mirage-1.4/src/index.js
+ExecStart=$MOCK_NODE $TMP/srv/web/mirage-1.4/src/index.js
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -134,7 +141,7 @@ check "unit file picked up" "$TMP/units/mirage-custom.service" "$SERVICE_UNIT"
 check "unit name"    "mirage-custom.service" "$SERVICE_NAME"
 check "user from unit"   "srvuser" "$APP_USER"
 check "port from unit"   "8899"    "$PORT"
-check "node from unit"   "/usr/local/bin/node" "$NODE_BIN"
+check "node from unit"   "$MOCK_NODE" "$NODE_BIN"
 check "domain falls back to default" "$DEFAULT_DOMAIN" "$DOMAIN"
 
 echo "== unit parsing (renamed units, odd paths) =="
@@ -170,8 +177,8 @@ check "found via generic unit scan" "$TMP/srv/web/mirage-1.4" "$d"
 echo "== discovery: filesystem walk (dir not in known locations) =="
 reset_env; rm -f "$TMP/units/"*.service
 mkdir -p "$TMP/phase-walk/naive" && make_app "$TMP/phase-walk/naive/mirage" 9100
-mkdir -p "$TMP/phase-walk/opt/mirage" && make_app "$TMP/phase-walk/opt/mirage" 9200
-export MIRAGE_SEARCH_ROOTS="$TMP/phase-walk"; export MIRAGE_COMMON_DIRS=""
+# One eligible tree: filesystem enumeration order is not a discovery contract.
+export MIRAGE_SEARCH_ROOTS="$TMP/phase-walk"; export MIRAGE_COMMON_DIRS="$TMP/empty-common"
 d=""; find_mirage_dir && d="$FOUND_DIR"
 check "found by dir name" "$TMP/phase-walk/naive/mirage" "$d"
 case "$DISCOVERY_SOURCE" in *"filesystem scan (dirname)"*) pass "source = dirname scan";;
@@ -219,11 +226,12 @@ if find_mirage_dir; then fail "decoy adopted: $FOUND_DIR"; else pass "decoy not 
 log_hit=0
 for l in "${DISCOVERY_LOG[@]:-}"; do [[ "$l" == *"$TMP/phase-decoy/decoy/mirage"* ]] && log_hit=1; done
 check "decoy logged as rejected" "1" "$log_hit"
-export MIRAGE_COMMON_DIRS=""
+export MIRAGE_COMMON_DIRS="$TMP/empty-common"
 
 echo "== source checkout is never adopted implicitly =="
 reset_env
-export MIRAGE_SEARCH_ROOTS="$SELF_DIR_PARENT"
+# Search only this checkout, not unrelated sibling installs.
+export MIRAGE_SEARCH_ROOTS="$SELF_DIR"
 check "SELF_DIR detected as a Mirage tree" "yes" "$(is_mirage_dir "$SELF_DIR" && echo yes || echo no)"
 if find_mirage_dir; then fail "adopted its own checkout: $FOUND_DIR"; else pass "own checkout not adopted"; fi
 log_hit=0

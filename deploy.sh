@@ -338,6 +338,8 @@ find_unit_for_dir() { # DIR -> unit file path
 
 # ---------------------------------------------------------- process discovery
 process_candidates() {
+    # Fixture tests must not discover installations through host processes.
+    [[ "${MIRAGE_TEST_ISOLATION:-0}" == 1 ]] && return 0
     local p cmd path cwd
     for p in /proc/[0-9]*; do
         [[ -r "$p/cmdline" ]] || continue
@@ -583,6 +585,8 @@ find_chromium_bin() {
 }
 
 nginx_conf_for() { # PORT -> conf path
+    # Fixture tests must not inherit the host's domain/configuration.
+    [[ "${MIRAGE_TEST_ISOLATION:-0}" == 1 ]] && return 1
     local port="${1:-7788}" f
     for f in /etc/nginx/conf.d/mirage.conf /etc/nginx/sites-enabled/mirage /etc/nginx/sites-enabled/mirage.conf; do
         [[ -f "$f" ]] && { printf '%s\n' "$f"; return 0; }
@@ -1784,7 +1788,14 @@ do_update() {
         warn "service '$SERVICE_NAME' is not active — updating the files anyway"
     fi
 
-    make_backup
+    # A verified backup is mandatory before the swap: without it there is no rollback
+    # safety net, and a half-copied tree must never be treated as a good backup.
+    if ! make_backup || [[ -z "$BACKUP_DIR" || ! -d "$BACKUP_DIR" ]]; then
+        err "update aborted: a verified backup is required and none was created"
+        if (( was_active )); then service_start; fi
+        _post_failure_health
+        return 1
+    fi
 
     if ! apply_payload; then
         err "failed to apply the new version"
