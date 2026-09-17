@@ -103,29 +103,30 @@ async function main() {
       if (msg.type === 'input' && msg.channel?.startsWith?.('live:')) {
         if (!canOperateWs) return conn.sendJSON({ type: 'error', error: 'viewer cannot control kernels' });
         const pid = msg.channel.slice(5); const ev = msg.ev || {};
+        // fire-and-forget, but never silently: recurring failures surface in the log (throttled)
+        const run = (p) => { Promise.resolve(p).catch(e => noteInputError(pid, e)); };
         try {
-          if (ev.kind === 'mouse') bm.inputMouse(pid, ev).catch(() => { });
-          else if (ev.kind === 'key') bm.inputKey(pid, ev).catch(() => { });
-          else if (ev.kind === 'wheel') bm.inputMouse(pid, { type: 'mouseWheel', x: ev.x, y: ev.y, deltaX: ev.deltaX || 0, deltaY: ev.deltaY || 0 }).catch(() => { });
+          if (ev.kind === 'mouse' || ev.kind === 'touch') run(bm.inputMouse(pid, ev));
+          else if (ev.kind === 'key') run(bm.inputKey(pid, ev));
+          else if (ev.kind === 'wheel') run(bm.inputMouse(pid, { type: 'mouseWheel', x: ev.x, y: ev.y, deltaX: ev.deltaX || 0, deltaY: ev.deltaY || 0 }));
           else if (ev.kind === 'clipboard') {
-            // Обработка буфера обмена: copy/cut/paste между системой и браузером
             if (ev.action === 'copy' || ev.action === 'cut') {
-              // Копирование из браузера в системный буфер - читаем выделенный текст через CDP
-              (async () => {
-                try {
-                  const text = await bm.evaluate(pid, 'document.getSelection()?.toString() || ""');
-                  // Отправляем текст клиенту для сохранения в системный буфер
-                  hub.broadcast(msg.channel, { type: 'clipboard', action: 'copy', text: text || '' });
-                } catch (e) { }
-              })();
+              run((async () => {
+                // read the selection BEFORE cutting (cut collapses it — order matters)
+                const text = await bm.evaluate(pid, 'document.getSelection()?.toString() || ""');
+                hub.broadcast(msg.channel, { type: 'clipboard', action: 'copy', text: text || '' });
+                if (ev.action === 'cut') {
+                  const mods = ev.modifiers ?? 2;
+                  await bm.inputKey(pid, { type: 'keyDown', key: 'x', code: 'KeyX', modifiers: mods });
+                  await bm.inputKey(pid, { type: 'keyUp', key: 'x', code: 'KeyX', modifiers: mods });
+                }
+              })());
             } else if (ev.action === 'paste') {
-              // Вставка из системного буфера в браузер - текст приходит от клиента
-              if (ev.text) {
-                await bm.inputKey(pid, { type: 'char', key: ev.text, text: ev.text });
-              }
+              // paste from the system clipboard — text arrives from the client
+              if (ev.text) run(bm.inputKey(pid, { type: 'char', key: ev.text, text: ev.text }));
             }
           }
-        } catch (e) { }
+        } catch (e) { noteInputError(pid, e); }
         return;
       }
       if (msg.type === 'rpc') { // ws-based RPC for live toolbar
@@ -140,6 +141,14 @@ async function main() {
     conn.on('close', () => { for (const c of conn._channels) hub.leave(c, conn); });
   }, (req) => api.authOk(req));
   function startLive(pid) { try { if (bm.isRunning(pid)) bm.startLive(pid, { fps: loadSettings().liveFps || 6 }); } catch (e) { } }
+  const _inputErr = new Map();   // pid -> { n, last } — so "clicks do nothing" is diagnosable
+  function noteInputError(pid, e) {
+    const r = _inputErr.get(pid) || { n: 0, last: 0 };
+    r.n++;
+    const nowMs = Date.now();
+    if (nowMs - r.last > 10000) { r.last = nowMs; warn('live-input', pid + ': ' + ((e && e.message) || e) + (r.n > 1 ? ` (${r.n} errors)` : '')); r.n = 0; }
+    _inputErr.set(pid, r);
+  }
   hub.onLeave((channel) => { if (channel.startsWith('live:') && hub.count(channel) === 0) bm.stopLive(channel.slice(5)); });
 
   const PORT = +(process.env.PORT || 7788);

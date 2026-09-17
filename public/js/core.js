@@ -688,7 +688,7 @@ function wsConnect() {
     if (typeof e.data !== 'string') { if (window.onLiveFrame) onLiveFrame(e.data); return; }
     let m; try { m = JSON.parse(e.data); } catch { return; }
     if (m.type === 'browsers') onBrowsersMsg(m.running);
-    else if (['meta', 'targets', 'nav', 'closed'].includes(m.type)) { if (window.onLiveMsg) onLiveMsg(m); }
+    else if (['meta', 'targets', 'nav', 'closed', 'clipboard'].includes(m.type)) { if (window.onLiveMsg) onLiveMsg(m); }
     else if (m.type === 'rpc' && m.id && RPC.pend.has(m.id)) { const p = RPC.pend.get(m.id); RPC.pend.delete(m.id); m.error ? p.rej(new Error(m.error)) : p.res(m.result); }
     else if (m.type === 'pong') { /* keepalive */ }
   };

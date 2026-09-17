@@ -320,9 +320,28 @@ export class BrowserManager {
       if (t && t.ready) { try { await s.cdp.send('Page.navigate', { url: normalizeUrl(url) }, t.sessionId); } catch (e) { } break; }
       await sleep(150);
     }
+    // follow the new tab: input routing, screencast and the active-tab highlight must move to it,
+    // otherwise clicks keep landing in (and the stream keeps showing) the previous tab.
+    s.firstTargetId = targetId;
+    await s.cdp.send('Target.activateTarget', { targetId }).catch(() => { });
+    this._broadcastTargets(s);
+    if (s.screencastOn) { try { await this.stopLive(profileId); } catch (e) { } this.startLive(profileId, { fps: this.global.liveFps || 6 }).catch(() => { }); }
     return targetId;
   }
-  async closeTab(profileId, targetId) { const s = this._need(profileId); await s.cdp.send('Target.closeTarget', { targetId }).catch(() => { }); }
+  async closeTab(profileId, targetId) {
+    const s = this._need(profileId);
+    await s.cdp.send('Target.closeTarget', { targetId }).catch(() => { });
+    s.targets.delete(targetId);
+    if (s.firstTargetId === targetId) {
+      // the visible tab is gone — fall back to the most recent live page so input and the
+      // stream don't point at a dead target (which surfaces as "clicks do nothing").
+      const rest = Array.from(s.targets.entries()).filter(([, v]) => v.type === 'page');
+      s.firstTargetId = rest.length ? rest[rest.length - 1][0] : null;
+      if (s.firstTargetId) await s.cdp.send('Target.activateTarget', { targetId: s.firstTargetId }).catch(() => { });
+      this._broadcastTargets(s);
+      if (s.screencastOn && s.firstTargetId) { try { await this.stopLive(profileId); } catch (e) { } this.startLive(profileId, { fps: this.global.liveFps || 6 }).catch(() => { }); }
+    }
+  }
   async activateTab(profileId, targetId) {
     const s = this._need(profileId);
     // Update firstTargetId so _broadcastTargets marks the correct tab as active
@@ -356,25 +375,37 @@ export class BrowserManager {
 
   async inputMouse(profileId, ev) {
     const s = this._need(profileId); const t = this._pick(s); s._lastInput = Date.now();
+    const x = Math.max(0, Math.round(ev.x || 0)), y = Math.max(0, Math.round(ev.y || 0));
+    if (ev.kind === 'touch' || ev.pointerType === 'touch') {
+      const map = { mousePressed: 'touchStart', mouseReleased: 'touchEnd', mouseMoved: 'touchMove' };
+      await s.cdp.send('Input.dispatchTouchEvent', { type: map[ev.type] || 'touchMove', touchPoints: [{ x, y }] }, t.sessionId);
+      return;
+    }
     await s.cdp.send('Input.dispatchMouseEvent', {
-      type: ev.type, x: Math.round(ev.x), y: Math.round(ev.y),
-      button: ev.button || 'left', clickCount: ev.clickCount || (ev.type === 'mousePressed' ? 1 : 0),
-      buttons: ev.buttons ?? (ev.type === 'mousePressed' ? 1 : ev.type === 'mouseReleased' ? 0 : -1),
-      deltaX: ev.deltaX || 0, deltaY: ev.deltaY || 0, pointerType: ev.pointerType || 'mouse',
+      type: ev.type, x, y,
+      button: ev.type === 'mouseMoved' ? 'none' : (ev.button || 'left'),
+      clickCount: ev.clickCount || (ev.type === 'mousePressed' ? 1 : 0),
+      buttons: ev.buttons ?? (ev.type === 'mousePressed' ? 1 : 0),
+      deltaX: ev.deltaX || 0, deltaY: ev.deltaY || 0, pointerType: 'mouse',
     }, t.sessionId);
   }
   async inputKey(profileId, ev) {
     const s = this._need(profileId); const t = this._pick(s); s._lastInput = Date.now();
-    // Для печатных символов используем insertText только один раз при keyDown
-    if (ev.type === 'keyDown' && ev.text && ev.key && ev.key.length === 1) {
-      await s.cdp.send('Input.insertText', { text: ev.text }, t.sessionId).catch(() => { });
-      return; // Не отправляем dispatchKeyEvent для печатных символов
-    }
     if (ev.type === 'char') {
-      await s.cdp.send('Input.insertText', { text: ev.text || ev.key }, t.sessionId).catch(() => { });
+      // multi-char paste from the system clipboard — insert verbatim, no key events
+      await s.cdp.send('Input.insertText', { text: ev.text ?? ev.key ?? '' }, t.sessionId).catch(() => { });
       return;
     }
-    await s.cdp.send('Input.dispatchKeyEvent', { type: ev.type, key: ev.key, code: ev.code, text: ev.text, modifiers: ev.modifiers || 0, windowsVirtualKeyCode: vkc(ev.key), nativeVirtualKeyCode: vkc(ev.key) }, t.sessionId);
+    // Full dispatchKeyEvent pairs (keyDown with text → keyUp), so pages see realistic keydown /
+    // input / keyup sequences — masks, hotkeys and behavior checks all work, unlike insertText-only.
+    const type = ev.type === 'keyUp' ? 'keyUp' : ev.type === 'rawKeyDown' ? 'rawKeyDown' : 'keyDown';
+    const params = {
+      type, key: ev.key || '', code: ev.code || '', modifiers: ev.modifiers || 0,
+      windowsVirtualKeyCode: vkc(ev.key, ev.code), nativeVirtualKeyCode: vkc(ev.key, ev.code),
+    };
+    if (type !== 'keyUp' && typeof ev.text === 'string' && ev.text.length === 1) { params.text = ev.text; params.unmodifiedText = ev.text; }
+    if (ev.repeat) params.autoRepeat = true;
+    await s.cdp.send('Input.dispatchKeyEvent', params, t.sessionId);
   }
 
   // ---- behavioral humanization (fluent, curved, variable-speed input) ----
@@ -433,10 +464,18 @@ export class BrowserManager {
     s.screencastOn = true; s._fpsCount = 0; this._emitApp();
     let t; try { t = this._pick(s); } catch (e) { s.screencastOn = false; return; }
     const sid = t.sessionId;
+    // CSS viewport size for pointer mapping (cheap getLayoutMetrics, no Runtime.enable).
+    // Screencast metadata is in device pixels — without this, clicks overshoot ×DPR on
+    // retina/mobile-emulation profiles. Refreshed in the background, attached to every meta.
+    const refreshCss = async () => { try { const lm = await this.layoutMetrics(profileId); s._cssBox = { cssWidth: lm.w, cssHeight: lm.h }; } catch (e) { } };
+    await refreshCss();
+    if (s._cssTimer) { try { clearInterval(s._cssTimer); } catch (e) { } }
+    s._cssTimer = setInterval(refreshCss, 2000);
+    s._cssTimer.unref?.();
     const emit = (b64, meta) => {
       s.lastShot = b64; s.screenshots++; s._fpsCount++;
       this.hub.broadcast('live:' + profileId, Buffer.from(b64, 'base64'), { binary: true });
-      this.hub.broadcast('live:' + profileId, { type: 'meta', ...meta });
+      this.hub.broadcast('live:' + profileId, { type: 'meta', ...meta, ...(s._cssBox || {}) });
     };
     let done = false;
     const offEvt = s.cdp.on('Page.screencastFrame', (p, evSid) => {
@@ -473,7 +512,7 @@ export class BrowserManager {
     const emitPoll = (b64, lm) => {
       s.lastShot = b64; s.screenshots++; s._fpsCount++;
       this.hub.broadcast('live:' + profileId, Buffer.from(b64, 'base64'), { binary: true });
-      this.hub.broadcast('live:' + profileId, { type: 'meta', screenWidth: lm.w, screenHeight: lm.h, screenshotWidth: lm.w, screenshotHeight: lm.h, deviceScaleFactor: 1 });
+      this.hub.broadcast('live:' + profileId, { type: 'meta', screenWidth: lm.w, screenHeight: lm.h, screenshotWidth: lm.w, screenshotHeight: lm.h, deviceScaleFactor: 1, cssWidth: lm.w, cssHeight: lm.h });
     };
     loop();
   }
@@ -481,6 +520,7 @@ export class BrowserManager {
     const s = this.sessions.get(profileId);
     if (!s) return;
     s.screencastOn = false;
+    if (s._cssTimer) { try { clearInterval(s._cssTimer); } catch (e) { } s._cssTimer = null; }
     if (s._nativeScreencast) { try { const t = this._pick(s); await s.cdp.send('Page.stopScreencast', {}, t.sessionId); } catch (e) { } s._nativeScreencast = false; }
     this._emitApp();
   }
@@ -531,6 +571,7 @@ export class BrowserManager {
   _cleanup(sess, reason) {
     if (sess._cleaned) return; sess._cleaned = true;
     sess.screencastOn = false; sess.status = 'stopped';
+    if (sess._cssTimer) { try { clearInterval(sess._cssTimer); } catch (e) { } sess._cssTimer = null; }
     for (const off of sess.listenersOff) { try { off(); } catch (e) { } }
     if (sess.cdp) { try { sess.cdp.close(); } catch (e) { } }
     if (sess.child) {
@@ -560,7 +601,30 @@ export class BrowserManager {
 }
 
 function normalizeUrl(u) { if (!u) return 'about:blank'; if (/^(https?|about|file):\/\//i.test(u) || u === 'about:blank') return u; return 'https://' + u; }
-function vkc(key) { const m = { Enter: 13, Escape: 27, Backspace: 8, Tab: 9, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39 }; if (m[key]) return m[key]; if (key && key.length === 1) return key.toUpperCase().charCodeAt(0); return 0; }
+// Windows virtual-key code for CDP dispatchKeyEvent. Physical `code` wins over `key` so
+// non-Latin layouts still report the Latin VK (KeyA→65 even when key='ф'), like real keyboards.
+export function vkc(key, code) {
+  if (code) {
+    if (/^Key[A-Z]$/.test(code)) return code.charCodeAt(3);
+    if (/^Digit[0-9]$/.test(code)) return code.charCodeAt(5);
+    if (/^Numpad[0-9]$/.test(code)) return 96 + (+code.slice(6));
+    if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) { const n = +code.slice(1); return n <= 12 ? 111 + n : 0; }
+    const cm = {
+      Enter: 13, NumpadEnter: 13, Escape: 27, Backspace: 8, Tab: 9, Space: 32, Delete: 46, Insert: 45,
+      Home: 36, End: 35, PageUp: 33, PageDown: 34, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39,
+      ShiftLeft: 16, ShiftRight: 16, ControlLeft: 17, ControlRight: 17, AltLeft: 18, AltRight: 18,
+      MetaLeft: 91, MetaRight: 93, ContextMenu: 93, CapsLock: 20, NumLock: 144, ScrollLock: 145,
+      Semicolon: 186, Equal: 187, Comma: 188, Minus: 189, Period: 190, Slash: 191, Backquote: 192,
+      BracketLeft: 219, Backslash: 220, BracketRight: 221, Quote: 222,
+      NumpadAdd: 107, NumpadSubtract: 109, NumpadMultiply: 106, NumpadDivide: 111, NumpadDecimal: 110,
+    };
+    if (cm[code]) return cm[code];
+  }
+  const m = { Enter: 13, Escape: 27, Backspace: 8, Tab: 9, ' ': 32, Delete: 46, ArrowUp: 38, ArrowDown: 40, ArrowLeft: 37, ArrowRight: 39, Shift: 16, Control: 17, Alt: 18, Meta: 91 };
+  if (m[key]) return m[key];
+  if (key && key.length === 1) { const c = key.toUpperCase().charCodeAt(0); return c < 128 ? c : 0; }
+  return 0;
+}
 function resolveProxy(profile, db) {
   if (profile.proxy_id) { const p = db.getProxy(profile.proxy_id); if (p) return p; }
   const inline = profile.inline_proxy;

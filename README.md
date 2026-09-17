@@ -9,7 +9,7 @@ Nstbrowser / GeeLark / GoLogin's cloud mode, but entirely self-hosted and zero-d
 node >= 22 (node:sqlite, global WebSocket)     →  no npm install, no build step
 src/            backend (ESM)
 public/         SPA frontend (vanilla, no framework)
-test/selftest.js 31 engine tests
+test/selftest.js 32 engine tests
 data/           SQLite db + per-profile kernel dirs (created at runtime)
 ```
 
@@ -30,7 +30,7 @@ self-hosted и **без единой зависимости** — нужен т�
 node >= 22 (node:sqlite, глобальный WebSocket)   →  без npm install, без сборки
 src/             backend (ESM)
 public/          SPA-фронтенд (vanilla, без фреймворка)
-test/selftest.js 31 тест движка
+test/selftest.js 32 теста движка
 data/            SQLite БД + каталоги ядер по профилям (создаются при запуске)
 ```
 
@@ -393,7 +393,7 @@ In the UI this is the **"⚙ Generate a batch for a country"** card on the New-p
 
 ## 5 · Verified on this machine
 
-* `npm run selftest` → **31/31** (determinism, 32-combo audit-clean generation, contradiction
+* `npm run selftest` → **32/32** (determinism, 32-combo audit-clean generation, contradiction
   catchers, bundle compile & stability, pool sanity, device-model + behavioral + already-alive +
   WebRTC + DNA + rotation coherence, and a real JA3 capture).
 * End-to-end: profile launched (real Chromium 152, display :0/Xvfb), 60-probe checker executed
@@ -495,7 +495,7 @@ moved install).
 
 A full audit (see `AUDIT.md`) drove a set of fixes; they are enforced and verified by the pre-prod
 gate `test/prodcheck.mjs` (**26 PASS · 1 FAIL** — the only remaining FAIL is *TLS*, an infra step,
-not code) and keep `test/selftest.js` at **31 passed / 0 failed**.
+not code) and keep `test/selftest.js` at **32 passed / 0 failed**.
 
 **AuthN / AuthZ**
 - **Global auth gate** on every `/api/*` route — a valid session cookie **or** an `X-Api-Key` is

@@ -1,7 +1,11 @@
 /* ============ Mirage live view (cloud-browser UX) + fingerprint lab ============ */
 
-const Live = { meta: null, frames: 0, lastFpsAt: 0, objUrl: null, img: null };
-window.LiveCleanup = () => { Live.img = null; Live.meta = null; };
+const Live = { meta: null, frames: 0, lastFpsAt: 0, objUrl: null, img: null, _cleanups: [] };
+window.LiveCleanup = () => {
+  for (const fn of (Live._cleanups || [])) { try { fn(); } catch (_) {} }
+  Live._cleanups = [];
+  Live.img = null; Live.meta = null;
+};
 
 window.onLiveFrame = (buf) => {
   if (App.state.view !== 'live') return;
@@ -58,11 +62,14 @@ function drawTabStrip() {
       <span class="tt">${App.esc(t.title || t.url || 'tab')}</span>
       ${ts.length > 1 ? `<b data-close="${t.id}" style="cursor:pointer">✕</b>` : ''}</span>`).join('') + `<span class="tabchip" id="tabAdd" style="max-width:34px;justify-content:center">+</span>`;
   strip.onclick = e => {
+    // keep driving the page without an extra click: hand focus back to the input stage
+    const refocus = () => { const st = document.getElementById('lvStage'); if (st) setTimeout(() => { try { st.focus({ preventScroll: true }); } catch (_) { try { st.focus(); } catch (__) {} } }, 60); };
     const close = e.target.closest('[data-close]');
-    if (close) { e.stopPropagation(); rpc('browser.tab', { profileId: App.state.live.pid, action: 'close', targetId: close.dataset.close }); return; }
-    if (e.target.closest('#tabAdd')) { const url = prompt('Open URL in new tab:', 'https://example.com'); if (url !== null) rpc('browser.tab', { profileId: App.state.live.pid, action: 'new', url }); return; }
+    if (close) { e.stopPropagation(); rpc('browser.tab', { profileId: App.state.live.pid, action: 'close', targetId: close.dataset.close }); refocus(); return; }
+    if (e.target.closest('#tabAdd')) { const url = prompt('Open URL in new tab:', 'https://example.com'); if (url !== null) rpc('browser.tab', { profileId: App.state.live.pid, action: 'new', url }); refocus(); return; }
     const chip = e.target.closest('[data-tid]');
     if (chip) rpc('browser.tab', { profileId: App.state.live.pid, action: 'activate', targetId: chip.dataset.tid });
+    refocus();
   };
 }
 function syncUrlBar(targets) {
@@ -75,6 +82,7 @@ function syncUrlBar(targets) {
 /* ---- rpc (browser.* commands) is provided by core.js ---- */
 
 ROUTES.live = (view, params) => {
+  if (window.LiveCleanup) LiveCleanup(); // drop stale window listeners on re-render (launch → rerender)
   const pid = params[0];
   const prof = profileOf(pid);
   const running = !!sessOf(pid);
@@ -110,7 +118,9 @@ ROUTES.live = (view, params) => {
     else if (document.fullscreenElement) document.exitFullscreen().catch(() => { });
   };
   fsb.onclick = () => setFull(!host.classList.contains('full'));
-  document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement && host.isConnected) setFull(false); });
+  const onFsChange = () => { if (!document.fullscreenElement && host.isConnected) setFull(false); };
+  document.addEventListener('fullscreenchange', onFsChange);
+  Live._cleanups.push(() => document.removeEventListener('fullscreenchange', onFsChange));
   const img = Live.img;
   if (!running) {
     guard(async () => { await launchProfile(pid); toast('Launched'); }).then(() => setTimeout(rerender, 1200));
@@ -143,86 +153,117 @@ ROUTES.live = (view, params) => {
 
   /* ---- input capture ---- */
   const stage = document.getElementById('lvStage');
-  let focused = false, downBtn = null, downAt = 0, clickCount = 0, lastMove = 0;
+  let focused = false, downBtn = null, downAt = 0, clickCount = 0, lastMove = 0, lastP = { x: 0, y: 0 };
+  const setHint = t => { const h = document.getElementById('lvHint'); if (h) h.textContent = t; };
+  const capture = () => {
+    if (!focused) { focused = true; setHint('input captured · Esc to release'); }
+    if (document.activeElement !== stage) { try { stage.focus({ preventScroll: true }); } catch (_) { try { stage.focus(); } catch (__) {} } }
+  };
+  const release = () => {
+    focused = false; downBtn = null;
+    setHint('click the page to capture input');
+    try { stage.blur(); } catch (_) {}
+  };
   const toCSS = e => {
     const m = Live.meta || {};
     const r = img.getBoundingClientRect();
-    const sw = m.screenWidth || m.deviceWidth || m.screenshotWidth || r.width, sh = m.screenHeight || m.deviceHeight || m.screenshotHeight || r.height;
-    return { x: Math.round((e.clientX - r.left) / r.width * sw), y: Math.round((e.clientY - r.top) / r.height * sh) };
+    // cssWidth/cssHeight (kernel layout metrics) stay correct under DPR≠1 and mobile emulation;
+    // raw screencast metadata is in device pixels and would overshoot there.
+    const sw = m.cssWidth || m.screenWidth || m.deviceWidth || m.screenshotWidth || r.width || 1;
+    const sh = m.cssHeight || m.screenHeight || m.deviceHeight || m.screenshotHeight || r.height || 1;
+    const w = r.width || 1, h = r.height || 1;
+    const x = (e.clientX - r.left) / w * sw, y = (e.clientY - r.top) / h * sh;
+    return {
+      x: Math.max(0, Math.min(Math.round(x), Math.max(0, Math.round(sw) - 1))),
+      y: Math.max(0, Math.min(Math.round(y), Math.max(0, Math.round(sh) - 1))),
+    };
   };
-  stage.addEventListener('mousedown', e => { if (e.target !== img) return; focused = true; stage.focus(); document.getElementById('lvHint').textContent = 'input captured · Esc to release'; });
-  // Автофокус при переключении вкладки - чтобы не нужно было нажимать Tab перед вводом
-  const observer = new MutationObserver(() => {
-    if (focused && document.activeElement !== stage && !['liveUrl'].includes(document.activeElement?.id)) {
-      stage.focus();
-    }
-  });
-  observer.observe(strip, { childList: true, subtree: true });
+  const btnName = b => (b === 2 ? 'right' : b === 1 ? 'middle' : 'left');
+  const btnMask = b => (b === 2 ? 2 : b === 1 ? 4 : 1); // CDP/DOM bitmask: left=1 right=2 middle=4
+  stage.addEventListener('mousedown', e => { if (e.target !== img) return; capture(); });
   stage.addEventListener('contextmenu', e => e.preventDefault());
-  img.addEventListener('pointerdown', e => {
+  // Focus left the stage while a modifier was held → the remote side would see a stuck
+  // Ctrl/Shift/Alt. Release them explicitly but keep hover/click capture armed.
+  stage.addEventListener('blur', () => {
     if (!focused) return;
-    e.preventDefault();
-    const p = toCSS(e); const button = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
-    const now = Date.now(); clickCount = (button === downBtn && now - downAt < 450) ? clickCount + 1 : 1; downBtn = button; downAt = now;
-    wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'mouse', type: 'mousePressed', ...p, button, clickCount, buttons: 1 } });
-  });
-  window.addEventListener('pointerup', e => {
-    if (!focused || !downBtn) return;
-    const p = toCSS(e);
-    wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'mouse', type: 'mouseReleased', ...p, button: downBtn, clickCount } });
+    for (const [key, code] of [['Control', 'ControlLeft'], ['Shift', 'ShiftLeft'], ['Alt', 'AltLeft'], ['Meta', 'MetaLeft']]) {
+      wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyUp', key, code, modifiers: 0 } });
+    }
     downBtn = null;
   });
-  img.addEventListener('pointermove', e => {
-    if (!focused) return; const now = performance.now(); if (now - lastMove < 33) return; lastMove = now;
-    const p = toCSS(e);
-    wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'mouse', type: 'mouseMoved', ...p, button: 'none', buttons: e.buttons } });
+  img.addEventListener('pointerdown', e => {
+    capture(); // the first click both captures input AND is delivered — never swallow it
+    e.preventDefault();
+    try { img.setPointerCapture(e.pointerId); } catch (_) {}
+    const p = toCSS(e); lastP = p;
+    const button = btnName(e.button);
+    const nowMs = Date.now();
+    clickCount = (button === downBtn && nowMs - downAt < 450) ? clickCount + 1 : 1;
+    downBtn = button; downAt = nowMs;
+    wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: e.pointerType === 'touch' ? 'touch' : 'mouse', type: 'mousePressed', ...p, button, clickCount, buttons: btnMask(e.button), pointerType: e.pointerType || 'mouse' } });
   });
-  img.addEventListener('wheel', e => { e.preventDefault(); const p = toCSS(e); wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'wheel', ...p, deltaX: e.deltaX, deltaY: e.deltaY } }); }, { passive: false });
+  const onPointerUp = e => {
+    if (!focused || !downBtn) return;
+    const p = toCSS(e); lastP = p;
+    wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: e.pointerType === 'touch' ? 'touch' : 'mouse', type: 'mouseReleased', ...p, button: downBtn, clickCount, buttons: 0 } });
+    downBtn = null;
+  };
+  window.addEventListener('pointerup', onPointerUp);
+  window.addEventListener('pointercancel', onPointerUp);
+  const onWinBlur = () => {
+    if (focused && downBtn) wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'mouse', type: 'mouseReleased', ...lastP, button: downBtn, clickCount, buttons: 0 } });
+    downBtn = null;
+  };
+  window.addEventListener('blur', onWinBlur);
+  Live._cleanups.push(() => {
+    window.removeEventListener('pointerup', onPointerUp);
+    window.removeEventListener('pointercancel', onPointerUp);
+    window.removeEventListener('blur', onWinBlur);
+  });
+  img.addEventListener('pointermove', e => {
+    if (!focused) return; const nowMs = performance.now(); if (nowMs - lastMove < 33) return; lastMove = nowMs;
+    const p = toCSS(e); lastP = p;
+    wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: e.pointerType === 'touch' && e.buttons ? 'touch' : 'mouse', type: 'mouseMoved', ...p, button: 'none', buttons: e.buttons || 0, pointerType: e.pointerType || 'mouse' } });
+  });
+  img.addEventListener('wheel', e => { if (!focused) capture(); e.preventDefault(); const p = toCSS(e); wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'wheel', ...p, deltaX: e.deltaX, deltaY: e.deltaY } }); }, { passive: false });
   stage.addEventListener('keydown', e => {
     if (!focused) return;
-    if (e.key === 'Escape') { focused = false; document.getElementById('lvHint').textContent = 'click the page to capture input'; stage.blur(); return; }
-    if (['liveUrl'].includes(document.activeElement?.id)) return;
+    if (e.key === 'Escape') { release(); return; }
     e.preventDefault();
     const mods = (e.ctrlKey ? 2 : 0) | (e.altKey ? 1 : 0) | (e.shiftKey ? 8 : 0) | (e.metaKey ? 4 : 0);
     const printable = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
-    
-    // Обработка горячих клавиш буфера обмена (Ctrl+C, Ctrl+V, Ctrl+X)
+
+    // System clipboard sync for Ctrl/⌘+C/X/V (the remote kernel has its own clipboard)
     if ((e.ctrlKey || e.metaKey) && ['c', 'v', 'x'].includes(e.key.toLowerCase())) {
-      if (e.key.toLowerCase() === 'c' || e.key.toLowerCase() === 'x') {
-        // Copy/Cut - читаем выделенный текст из браузера
-        wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'clipboard', action: e.key.toLowerCase() === 'c' ? 'copy' : 'cut' } });
-        // Также отправляем обычное событие клавиши для совместимости
-        wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, code: e.code || '', modifiers: mods } });
-      } else if (e.key.toLowerCase() === 'v') {
-        // Paste - запрашиваем текст из системного буфера и вставляем в браузер
-        (async () => {
-          try {
-            const text = await navigator.clipboard.readText();
-            wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'clipboard', action: 'paste', text: text } });
-          } catch (err) {
-            toast('Paste failed: access denied', 'warn');
-          }
-        })();
-        // Также отправляем обычное событие клавиши для совместимости
-        wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, code: e.code || '', modifiers: mods } });
+      const k = e.key.toLowerCase();
+      if (k === 'v') {
+        // Paste: read the SYSTEM clipboard and insert its text remotely; don't forward the
+        // combo itself or the page would paste its (stale) internal clipboard on top.
+        navigator.clipboard.readText().then(
+          text => { if (text) wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'clipboard', action: 'paste', text } }); },
+          () => toast('Paste failed: clipboard access denied', 'warn'));
+      } else if (k === 'c') {
+        // Copy: the selection survives, so let the page handle the combo AND mirror the text out
+        wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, code: e.code || '', modifiers: mods, repeat: e.repeat } });
+        wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'clipboard', action: 'copy', modifiers: mods } });
+      } else {
+        // Cut: the server reads the selection first, then performs the cut — no race
+        wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'clipboard', action: 'cut', modifiers: mods } });
       }
-      return; // Не отправляем больше ничего для Ctrl+C/V/X
+      return;
     }
-    
-    // Для печатных символов отправляем только keyDown (текст вставится через insertText на бэкенде)
-    if (printable) { 
-      wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, text: e.key, modifiers: mods } }); 
-    }
-    else wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyDown', key: e.key, code: e.code || '', modifiers: mods } });
+
+    // Full keyDown/keyUp pairs for every key (incl. printable ones, with code) so pages that
+    // listen for keydown/keyup (masks, hotkeys, bot-behavior checks) see realistic typing.
+    const ev = { kind: 'key', type: 'keyDown', key: e.key, code: e.code || '', modifiers: mods, repeat: !!e.repeat };
+    if (printable) { ev.text = e.key; }
+    wsSend({ type: 'input', channel: 'live:' + pid, ev });
   });
   stage.addEventListener('keyup', e => {
     if (!focused) return;
+    e.preventDefault();
     const mods = (e.ctrlKey ? 2 : 0) | (e.altKey ? 1 : 0) | (e.shiftKey ? 8 : 0) | (e.metaKey ? 4 : 0);
-    // Отправляем keyUp только для НЕпечатных клавиш (модификаторы, стрелки и т.д.)
-    const printable = e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey;
-    if (!printable) {
-      wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyUp', key: e.key, code: e.code || '', modifiers: mods } });
-    }
+    wsSend({ type: 'input', channel: 'live:' + pid, ev: { kind: 'key', type: 'keyUp', key: e.key, code: e.code || '', modifiers: mods } });
   });
 };
 

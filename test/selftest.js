@@ -7,6 +7,7 @@ import { buildStealthBundle } from '../src/fingerprint/stealth.js';
 import { modelById } from '../src/fingerprint/models.js';
 import { rngFor } from '../src/util.js';
 import { pointerPath, keystrokePlan, scrollPlan } from '../src/browser/humanize.js';
+import { vkc } from '../src/browser/manager.js';
 import { sealDNA, openDNA, dnaThumb } from '../src/fingerprint/dna.js';
 import { buildRotatedFingerprint } from '../src/browser/rotation.js';
 
@@ -168,6 +169,23 @@ t('humanization is deterministic for a given seed', () => {
   const a = keystrokePlan(rngFor('same'), 'abc'), b = keystrokePlan(rngFor('same'), 'abc');
   eq(a, b, 'keystroke plan not deterministic');
   eq(pointerPath(rngFor('p'), 0, 0, 500, 500), pointerPath(rngFor('p'), 0, 0, 500, 500), 'pointer path not deterministic');
+});
+
+console.log('\n◆ live-input key codes');
+t('vkc maps physical codes to Windows VKs (incl. non-Latin layouts)', () => {
+  eq(vkc('a', 'KeyA'), 65);
+  eq(vkc('ф', 'KeyA'), 65);   // Cyrillic on the A key still reports VK_A, like a real keyboard
+  eq(vkc('1', 'Digit1'), 49);
+  eq(vkc('Enter', 'Enter'), 13);
+  eq(vkc('Escape', 'Escape'), 27);
+  eq(vkc('Backspace', 'Backspace'), 8);
+  eq(vkc('Tab', 'Tab'), 9);
+  eq(vkc(' ', 'Space'), 32);
+  eq(vkc('ArrowLeft', 'ArrowLeft'), 37);
+  eq(vkc('Control', 'ControlLeft'), 17);
+  eq(vkc('F5', 'F5'), 116);
+  eq(vkc('a'), 65);           // legacy fallback without a code
+  eq(vkc('ф'), 0);            // non-ASCII without a code → 0, never a bogus VK
 });
 
 console.log('\n◆ already-alive coherence');
